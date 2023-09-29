@@ -8,8 +8,9 @@
 
 pub mod mq;
 
-use crate::bindings;
+use crate::fs::inode::INode;
 use crate::types::Opaque;
+use crate::{bindings, container_of};
 
 /// The type used for indexing onto a disc or disc partition.
 ///
@@ -38,5 +39,18 @@ impl Device {
     pub(crate) unsafe fn from_raw<'a>(ptr: *mut bindings::block_device) -> &'a Self {
         // SAFETY: The safety requirements guarantee that the cast below is ok.
         unsafe { &*ptr.cast::<Self>() }
+    }
+
+    /// Returns the inode associated with this block device.
+    pub fn inode(&self) -> &INode {
+        let inode =
+            container_of!(self.0.get(), bindings::bdev_inode, bdev) as *mut bindings::bdev_inode;
+
+        // SAFETY: This is what BD_INODE does to get a block device's inode.
+        // SAFETY: `vfs_inode` is never reassigned.
+        let ptr = unsafe { &raw mut (*inode).vfs_inode };
+
+        // SAFETY: `ptr` is valid as long as the block device remains valid as well.
+        unsafe { INode::from_raw(ptr) }
     }
 }
