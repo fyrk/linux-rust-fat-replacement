@@ -1,5 +1,11 @@
 #include <linux/fs.h>
 
+void *rust_helper_alloc_inode_sb(struct super_block *sb,
+				 struct kmem_cache *cache, gfp_t gfp)
+{
+	return alloc_inode_sb(sb, cache, gfp);
+}
+
 struct file *rust_helper_get_file(struct file *f)
 {
 	return get_file(f);
