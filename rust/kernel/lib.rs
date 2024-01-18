@@ -35,6 +35,7 @@ pub mod block;
 mod build_assert;
 pub mod device;
 pub mod error;
+pub mod file;
 #[cfg(CONFIG_RUST_FW_LOADER_ABSTRACTIONS)]
 pub mod firmware;
 pub mod init;
