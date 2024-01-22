@@ -4,7 +4,7 @@
 
 use kernel::fs::{dentry, file, file::File, inode, inode::INode, sb::SuperBlock, Offset};
 use kernel::prelude::*;
-use kernel::{c_str, fs, time::UNIX_EPOCH, types::Either, types::Locked};
+use kernel::{c_str, fs, time::UNIX_EPOCH, types::Either, types::Locked, uaccess};
 
 kernel::module_fs! {
     type: RoFs,
@@ -78,6 +78,10 @@ impl file::Operations for RoFs {
 
     fn seek(file: &File<Self>, offset: Offset, whence: file::Whence) -> Result<Offset> {
         file::generic_seek(file, offset, whence)
+    }
+
+    fn read(_: &File<Self>, _: &mut uaccess::UserSliceWriter, _: &mut Offset) -> Result<usize> {
+        Err(EISDIR)
     }
 
     fn read_dir(
