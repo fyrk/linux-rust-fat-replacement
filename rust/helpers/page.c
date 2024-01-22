@@ -90,3 +90,8 @@ void rust_helper_kunmap_local(const void *addr)
 {
 	kunmap_local(addr);
 }
+
+void rust_helper_mapping_set_large_folios(struct address_space *mapping)
+{
+	mapping_set_large_folios(mapping);
+}
