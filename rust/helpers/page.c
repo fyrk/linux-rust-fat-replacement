@@ -96,6 +96,16 @@ void rust_helper_mapping_set_large_folios(struct address_space *mapping)
 	mapping_set_large_folios(mapping);
 }
 
+unsigned int rust_helper_memalloc_nofs_save(void)
+{
+	return memalloc_nofs_save();
+}
+
+void rust_helper_memalloc_nofs_restore(unsigned int flags)
+{
+	memalloc_nofs_restore(flags);
+}
+
 struct folio *rust_helper_read_mapping_folio(struct address_space *mapping,
 					     pgoff_t index, struct file *file)
 {
