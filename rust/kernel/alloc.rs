@@ -109,6 +109,9 @@ pub mod flags {
     /// small allocations.
     pub const GFP_NOWAIT: Flags = Flags(bindings::GFP_NOWAIT);
 
+    /// Use direct reclaim but will not use any filesystem interfaces.
+    pub const GFP_NOFS: Flags = Flags(bindings::GFP_NOFS);
+
     /// Suppresses allocation failure reports.
     ///
     /// This is normally or'd with other flags.
