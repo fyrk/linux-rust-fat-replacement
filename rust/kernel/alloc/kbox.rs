@@ -199,6 +199,28 @@ where
     }
 }
 
+impl<T, A> Box<[MaybeUninit<T>], A>
+where
+    A: Allocator,
+{
+    /// Converts a `Box<[MaybeUninit<T>], A>` to a `Box<T, A>`.
+    ///
+    /// It is undefined behavior to call this function while the value inside of `b` is not yet
+    /// fully initialized.
+    ///
+    /// # Safety
+    ///
+    /// Callers must ensure that the value inside of `b` is in an initialized state.
+    pub unsafe fn assume_init(self) -> Box<[T], A> {
+        let raw = Self::into_raw(self);
+
+        // SAFETY: `raw` comes from a previous call to `Box::into_raw`. By the safety requirements
+        // of this function, the value inside the `Box` is in an initialized state. Hence, it is
+        // safe to reconstruct the `Box` as `Box<T, A>`.
+        unsafe { Box::from_raw(raw as *mut [T]) }
+    }
+}
+
 impl<T, A> Box<T, A>
 where
     A: Allocator,
@@ -233,6 +255,39 @@ where
         // INVARIANT: `ptr` is either a dangling pointer or points to memory allocated with `A`,
         // which is sufficient in size and alignment for storing a `T`.
         Ok(Box(ptr.cast(), PhantomData))
+    }
+
+    /// Allocates a new uninitialised box of a slice.
+    ///
+    /// The allocation may fail, in which case an error is returned.
+    pub fn new_uninit_slice(
+        len: usize,
+        flags: Flags,
+    ) -> Result<Box<[MaybeUninit<T>], A>, AllocError> {
+        let layout = Layout::array::<MaybeUninit<T>>(len).map_err(|_| AllocError)?;
+        let ptr = A::alloc(layout, flags)?;
+        let sptr = core::ptr::slice_from_raw_parts_mut(ptr.cast().as_ptr(), len);
+
+        // SAFETY: For non-ZST, we just allocated sufficient memory.
+        // For ZST, we use a dangling pointer.
+        Ok(unsafe { Box::from_raw(sptr) })
+    }
+
+    /// Allocates a new box with a slice.
+    ///
+    /// All elements are initialised with clones of `value`.
+    ///
+    /// The allocation may fail, in which case an error is returned.
+    pub fn new_slice(len: usize, value: T, flags: Flags) -> Result<Box<[T], A>, AllocError>
+    where
+        T: Clone,
+    {
+        let mut b = Self::new_uninit_slice(len, flags)?;
+        for v in b.iter_mut() {
+            v.write(value.clone());
+        }
+        // SAFETY: We just initialised all items above.
+        Ok(unsafe { b.assume_init() })
     }
 
     /// Constructs a new `Pin<Box<T, A>>`. If `T` does not implement [`Unpin`], then `x` will be
@@ -313,7 +368,7 @@ where
         // slot is valid.
         unsafe { init.__init(slot)? };
         // SAFETY: All fields have been initialized.
-        Ok(unsafe { Box::assume_init(self) })
+        Ok(unsafe { Box::<MaybeUninit<T>, A>::assume_init(self) })
     }
 
     fn write_pin_init<E>(mut self, init: impl PinInit<T, E>) -> Result<Pin<Self::Initialized>, E> {
@@ -322,7 +377,7 @@ where
         // slot is valid and will not be moved, because we pin it later.
         unsafe { init.__pinned_init(slot)? };
         // SAFETY: All fields have been initialized.
-        Ok(unsafe { Box::assume_init(self) }.into())
+        Ok(unsafe { Box::<MaybeUninit<T>, A>::assume_init(self) }.into())
     }
 }
 
