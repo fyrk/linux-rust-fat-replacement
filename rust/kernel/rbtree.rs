@@ -329,7 +329,7 @@ where
         while !(*child_field_of_parent).is_null() {
             let curr = *child_field_of_parent;
             // SAFETY: All links fields we create are in a `Node<K, V>`.
-            let node = unsafe { container_of!(curr, Node<K, V>, links) };
+            let node = container_of!(curr, Node<K, V>, links);
 
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
             match key.cmp(unsafe { &(*node).key }) {
@@ -377,7 +377,7 @@ where
         while !node.is_null() {
             // SAFETY: By the type invariant of `Self`, all non-null `rb_node` pointers stored in `self`
             // point to the links field of `Node<K, V>` objects.
-            let this = unsafe { container_of!(node, Node<K, V>, links) };
+            let this = container_of!(node, Node<K, V>, links);
             // SAFETY: `this` is a non-null node so it is valid by the type invariants.
             node = match key.cmp(unsafe { &(*this).key }) {
                 // SAFETY: `node` is a non-null node so it is valid by the type invariants.
@@ -424,7 +424,7 @@ where
         while !node.is_null() {
             // SAFETY: By the type invariant of `Self`, all non-null `rb_node` pointers stored in `self`
             // point to the links field of `Node<K, V>` objects.
-            let this = unsafe { container_of!(node, Node<K, V>, links) }.cast_mut();
+            let this = container_of!(node, Node<K, V>, links).cast_mut();
             // SAFETY: `this` is a non-null node so it is valid by the type invariants.
             let this_key = unsafe { &(*this).key };
             // SAFETY: `node` is a non-null node so it is valid by the type invariants.
@@ -486,7 +486,7 @@ impl<K, V> Drop for RBTree<K, V> {
         // INVARIANT: The loop invariant is that all tree nodes from `next` in postorder are valid.
         while !next.is_null() {
             // SAFETY: All links fields we create are in a `Node<K, V>`.
-            let this = unsafe { container_of!(next, Node<K, V>, links) };
+            let this = container_of!(next, Node<K, V>, links);
 
             // Find out what the next node is before disposing of the current one.
             // SAFETY: `next` and all nodes in postorder are still valid.
@@ -761,7 +761,7 @@ impl<'a, K, V> Cursor<'a, K, V> {
         let next = self.get_neighbor_raw(Direction::Next);
         // SAFETY: By the type invariant of `Self`, all non-null `rb_node` pointers stored in `self`
         // point to the links field of `Node<K, V>` objects.
-        let this = unsafe { container_of!(self.current.as_ptr(), Node<K, V>, links) }.cast_mut();
+        let this = container_of!(self.current.as_ptr(), Node<K, V>, links).cast_mut();
         // SAFETY: `this` is valid by the type invariants as described above.
         let node = unsafe { KBox::from_raw(this) };
         let node = RBTreeNode { node };
@@ -806,7 +806,7 @@ impl<'a, K, V> Cursor<'a, K, V> {
             unsafe { bindings::rb_erase(neighbor, addr_of_mut!(self.tree.root)) };
             // SAFETY: By the type invariant of `Self`, all non-null `rb_node` pointers stored in `self`
             // point to the links field of `Node<K, V>` objects.
-            let this = unsafe { container_of!(neighbor, Node<K, V>, links) }.cast_mut();
+            let this = container_of!(neighbor, Node<K, V>, links).cast_mut();
             // SAFETY: `this` is valid by the type invariants as described above.
             let node = unsafe { KBox::from_raw(this) };
             return Some(RBTreeNode { node });
@@ -912,7 +912,7 @@ impl<'a, K, V> Cursor<'a, K, V> {
     unsafe fn to_key_value_raw<'b>(node: NonNull<bindings::rb_node>) -> (&'b K, *mut V) {
         // SAFETY: By the type invariant of `Self`, all non-null `rb_node` pointers stored in `self`
         // point to the links field of `Node<K, V>` objects.
-        let this = unsafe { container_of!(node.as_ptr(), Node<K, V>, links) }.cast_mut();
+        let this = container_of!(node.as_ptr(), Node<K, V>, links).cast_mut();
         // SAFETY: The passed `node` is the current node or a non-null neighbor,
         // thus `this` is valid by the type invariants.
         let k = unsafe { &(*this).key };
@@ -1021,7 +1021,7 @@ impl<K, V> Iterator for IterRaw<K, V> {
 
         // SAFETY: By the type invariant of `IterRaw`, `self.next` is a valid node in an `RBTree`,
         // and by the type invariant of `RBTree`, all nodes point to the links field of `Node<K, V>` objects.
-        let cur = unsafe { container_of!(self.next, Node<K, V>, links) }.cast_mut();
+        let cur = container_of!(self.next, Node<K, V>, links).cast_mut();
 
         // SAFETY: `self.next` is a valid tree node by the type invariants.
         self.next = unsafe { bindings::rb_next(self.next) };
