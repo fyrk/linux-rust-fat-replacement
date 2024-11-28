@@ -57,6 +57,9 @@ pub mod mode {
 
     /// File type constant for sockets.
     pub const S_IFSOCK: u16 = bindings::S_IFSOCK as u16;
+
+    /// Mode that grants read access to everyone.
+    pub const S_IRUGO: u16 = bindings::S_IRUGO as u16;
 }
 
 /// Maximum size of an inode.

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+
+config RUST_FAT_FS
+	tristate "Rust FAT fs support"
+	depends on RUST && BLOCK
+	help
+	  To compile this file system support as a module, choose M here: the
+	  module will be called rust_fat.
+
+	  If unsure, say Y.

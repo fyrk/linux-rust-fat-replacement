@@ -343,6 +343,7 @@ source "fs/erofs/Kconfig"
 source "fs/vboxsf/Kconfig"
 source "fs/tarfs/Kconfig"
 source "fs/rust-ext2/Kconfig"
+source "fs/rust-fat/Kconfig"
 
 endif # MISC_FILESYSTEMS
 

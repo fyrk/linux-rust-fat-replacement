@@ -132,3 +132,4 @@ obj-$(CONFIG_ZONEFS_FS)		+= zonefs/
 obj-$(CONFIG_BPF_LSM)		+= bpf_fs_kfuncs.o
 obj-$(CONFIG_TARFS_FS)		+= tarfs/
 obj-$(CONFIG_RUST_EXT2_FS)	+= rust-ext2/
+obj-$(CONFIG_RUST_FAT_FS)   += rust-fat/

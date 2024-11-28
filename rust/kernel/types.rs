@@ -5,6 +5,7 @@
 use crate::init::{self, PinInit};
 use core::{
     cell::UnsafeCell,
+    fmt,
     marker::{PhantomData, PhantomPinned},
     mem::{align_of, size_of, ManuallyDrop, MaybeUninit},
     ops::{Deref, DerefMut},
@@ -643,6 +644,12 @@ impl<T: LittleEndian + Copy> LE<T> {
     /// Returns the native-endian value.
     pub fn value(&self) -> T {
         self.0.to_cpu()
+    }
+}
+
+impl<T: LittleEndian + Copy + fmt::Debug> fmt::Debug for LE<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        core::write!(f, "LE({:?}, {:#x?})", &self.value(), &self.0)
     }
 }
 
