@@ -3,6 +3,7 @@
 //! Definitions of FAT structures.
 
 use core::mem::size_of;
+use kernel::fs::file::DirEntryType;
 use kernel::prelude::*;
 use kernel::types::LE;
 
@@ -12,29 +13,30 @@ pub(crate) const MIN_FAT16_CLUSTERS: u32 = 4085;
 pub(crate) const MIN_FAT32_CLUSTERS: u32 = 65525;
 
 pub(crate) const FAT_DENTRY_SIZE: usize = size_of::<FatDirEntry>();
-
-pub(crate) struct Fat32Info {
-    pub(crate) root_cluster: u32,
-}
+static_assert!(FAT_DENTRY_SIZE == 32);
 
 #[allow(dead_code)]
 pub(crate) enum FatType {
     FAT12,
     FAT16,
-    FAT32(Fat32Info),
+    FAT32 { root_cluster: u32 },
 }
 
 impl FatType {
-    pub(crate) fn from_cluster_count(cluster_count: u32, bpb32: &BiosParamBlockFat32) -> FatType {
+    pub(crate) fn from_cluster_count(
+        cluster_count: u32,
+        _first_rootdir_sector: u32,
+        bpb32: &BiosParamBlockFat32,
+    ) -> FatType {
         if cluster_count < MIN_FAT16_CLUSTERS {
             FatType::FAT12
         } else if cluster_count < MIN_FAT32_CLUSTERS {
             FatType::FAT16
         } else {
             let root_cluster = bpb32.root_cluster;
-            FatType::FAT32(Fat32Info {
+            FatType::FAT32 {
                 root_cluster: root_cluster.value(),
-            })
+            }
         }
     }
 }
@@ -66,7 +68,7 @@ impl FatEntry {
                     FatEntry::Next(entry)
                 }
             }
-            FatType::FAT32(_) => {
+            FatType::FAT32 { root_cluster: _ } => {
                 if entry >= 0x0FFFFFF8 {
                     FatEntry::End
                 } else if entry == 0x0FFFFFF7 {
@@ -89,6 +91,7 @@ pub(crate) mod fat_dentry_attr {
     pub(crate) const DIRECTORY: u8 = 0x10;
     pub(crate) const ARCHIVE: u8 = 0x20;
     pub(crate) const LONG_NAME: u8 = READ_ONLY | HIDDEN | SYSTEM | VOLUME_ID;
+    pub(crate) const LONG_NAME_MASK: u8 = LONG_NAME | DIRECTORY | ARCHIVE;
 }
 
 #[macro_export]
@@ -172,28 +175,29 @@ kernel::derive_readable_from_bytes! {
         pub(crate) signature: LE<u16>,
     }
 
+    #[derive(Debug)]
     #[repr(C, packed)]
     pub(crate) struct FatDirEntry {
         /// name and extension
         /// `short_name[0] == 0xE5` => free
         /// `short_name[0] == 0x00` => free, and following entries also free
         /// `short_name[0] == 0x05` => actually 0xE5
-        short_name: [u8; 11],
-        attributes: LE<u8>,
+        pub(crate) short_name: [u8; 11],
+        pub(crate) attributes: LE<u8>,
         _reserved: u8,
         /// in centiseconds (0-199)
-        creation_time_cs: LE<u8>,
-        creation_time: LE<u16>,
-        creation_date: LE<u16>,
-        access_date: LE<u16>,
+        pub(crate) creation_time_cs: LE<u8>,
+        pub(crate) creation_time: LE<u16>,
+        pub(crate) creation_date: LE<u16>,
+        pub(crate) access_date: LE<u16>,
         /// high 16 bits of cluster, 0 for FAT12/16
-        first_cluster_hi: LE<u16>,
-        write_time: LE<u16>,
-        write_date: LE<u16>,
+        pub(crate) first_cluster_hi: LE<u16>,
+        pub(crate) write_time: LE<u16>,
+        pub(crate) write_date: LE<u16>,
         /// low 16 bits of cluster
-        first_cluster_lo: LE<u16>,
+        pub(crate) first_cluster_lo: LE<u16>,
         /// in bytes
-        file_size: LE<u32>,
+        pub(crate) file_size: LE<u32>,
     }
 }
 
@@ -206,5 +210,59 @@ impl FatBootSectorSignature {
                 return Err(EINVAL);
             }
         }
+    }
+}
+
+pub(crate) enum FatDirEntryName {
+    /// The directory entry is free.
+    Free,
+    /// This directory entry and all following directory entries are free.
+    FreeConsecutive,
+    /// This is a valid directory entry with this short name.
+    Name { short_name: [u8; 12], len: usize },
+}
+
+impl FatDirEntry {
+    pub(crate) fn name(&self) -> FatDirEntryName {
+        let mut name = self.short_name.clone();
+        match self.short_name[0] {
+            0xE5 => return FatDirEntryName::Free,
+            0x00 => return FatDirEntryName::FreeConsecutive,
+            0x05 => name[0] = 0xE5,
+            _ => (),
+        }
+        fn get_name_len(part: &[u8]) -> usize {
+            part.iter().rposition(|x| *x != b' ').map_or(0, |l| l + 1)
+        }
+        let base_len = get_name_len(&name[0..8]);
+        let ext_len = get_name_len(&name[8..11]);
+        let mut short_name = [b' '; 12];
+        short_name[..base_len].copy_from_slice(&name[..base_len]);
+        let len = if ext_len > 0 {
+            short_name[base_len] = b'.';
+            short_name[base_len + 1..base_len + 1 + ext_len].copy_from_slice(&name[8..8 + ext_len]);
+            base_len + 1 + ext_len
+        } else {
+            base_len
+        };
+        FatDirEntryName::Name { short_name, len }
+    }
+
+    pub(crate) fn first_cluster(&self) -> u32 {
+        ((unwrap_packed!(self.first_cluster_hi) as u32) << 16)
+            + (unwrap_packed!(self.first_cluster_lo) as u32)
+    }
+
+    /// Returns the directory entries type or
+    /// [`None`] when this directory entry should be ignored.
+    pub(crate) fn get_type(&self) -> Option<DirEntryType> {
+        let attributes = unwrap_packed!(self.attributes);
+        if attributes & fat_dentry_attr::HIDDEN != 0 {
+            return None;
+        }
+        if attributes & fat_dentry_attr::DIRECTORY != 0 {
+            return Some(DirEntryType::Dir);
+        }
+        Some(DirEntryType::Reg)
     }
 }
