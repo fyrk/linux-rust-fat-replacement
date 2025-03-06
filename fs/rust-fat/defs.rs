@@ -3,8 +3,8 @@
 //! Definitions of FAT structures.
 
 use core::mem::size_of;
-use kernel::fs::file::DirEntryType;
 use kernel::prelude::*;
+use kernel::time::Timespec;
 use kernel::types::LE;
 
 pub(crate) const FAT_ROOT_INO: u32 = 0;
@@ -222,6 +222,60 @@ pub(crate) enum FatDirEntryName {
     Name { short_name: [u8; 12], len: usize },
 }
 
+pub(crate) enum FatDirEntryType {
+    File,
+    Directory,
+    Other,
+}
+
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = SECONDS_PER_MINUTE * 60;
+const SECONDS_PER_DAY: u64 = SECONDS_PER_HOUR * 24;
+/// Days between 1970-01-01 and 1980-01-01 (2 leap days).
+const FAT_EPOCH_DAY_SHIFT: u64 = 365 * 10 + 2;
+const FAT_YEAR_2100: u16 = 120;
+/// Cumulative number of days until the respective 1sts in non-leap years.
+#[rustfmt::skip]
+const CUMULATIVE_DAYS_IN_YEAR: [u32; 12] = [
+    // Jan  Feb  Mar  Apr  May  Jun  Jul  Aug  Sep  Oct  Nov  Dec
+	     0,  31,  59,  90, 120, 151, 181, 212, 243, 273, 304, 334,
+];
+
+/// Convert FAT time fields into a [`Timespec`].
+fn timespec_from_fat(date: u16, time: u16, centiseconds: u8) -> Result<Timespec> {
+    let year = date >> 9;
+    let month = ((date >> 5) & 0b1111).clamp(1, 12) - 1;
+    let day = (date & 0b11111).clamp(1, 31) - 1;
+
+    let hour = time >> 11;
+    let minute = ((time >> 5) & 0b111111).clamp(0, 59);
+    let second = (time & 0b11111).clamp(0, 29) * 2 + (centiseconds as u16 / 100);
+
+    let mut leap_days = (year + 3) / 4;
+    if year > FAT_YEAR_2100 {
+        // 2100 is not a leap year
+        leap_days -= 1;
+    }
+    if year % 4 == 0 && year != FAT_YEAR_2100 && month > 2 {
+        leap_days += 1;
+    }
+
+    let sec = 0
+        + SECONDS_PER_DAY
+            * (FAT_EPOCH_DAY_SHIFT
+                + year as u64 * 365
+                + CUMULATIVE_DAYS_IN_YEAR[month as usize] as u64
+                + day as u64
+                + leap_days as u64)
+        + SECONDS_PER_HOUR * hour as u64
+        + SECONDS_PER_MINUTE * minute as u64
+        + second as u64;
+
+    // TODO: time zone offset
+
+    Timespec::new(sec, (centiseconds % 100) as u32 * 10000000)
+}
+
 impl FatDirEntry {
     pub(crate) fn name(&self) -> FatDirEntryName {
         let mut name = self.short_name.clone();
@@ -253,16 +307,35 @@ impl FatDirEntry {
             + (unwrap_packed!(self.first_cluster_lo) as u32)
     }
 
-    /// Returns the directory entries type or
-    /// [`None`] when this directory entry should be ignored.
-    pub(crate) fn get_type(&self) -> Option<DirEntryType> {
+    /// Returns the directory entry's type.
+    pub(crate) fn typ(&self) -> FatDirEntryType {
         let attributes = unwrap_packed!(self.attributes);
         if attributes & fat_dentry_attr::HIDDEN != 0 {
-            return None;
+            return FatDirEntryType::Other;
         }
         if attributes & fat_dentry_attr::DIRECTORY != 0 {
-            return Some(DirEntryType::Dir);
+            return FatDirEntryType::Directory;
         }
-        Some(DirEntryType::Reg)
+        FatDirEntryType::File
+    }
+
+    pub(crate) fn ctime(&self) -> Result<Timespec> {
+        timespec_from_fat(
+            unwrap_packed!(self.creation_date),
+            unwrap_packed!(self.creation_time),
+            unwrap_packed!(self.creation_time_cs),
+        )
+    }
+
+    pub(crate) fn mtime(&self) -> Result<Timespec> {
+        timespec_from_fat(
+            unwrap_packed!(self.write_date),
+            unwrap_packed!(self.write_time),
+            0,
+        )
+    }
+
+    pub(crate) fn atime(&self) -> Result<Timespec> {
+        timespec_from_fat(unwrap_packed!(self.access_date), 0, 0)
     }
 }

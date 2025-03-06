@@ -4,12 +4,12 @@
 
 use defs::*;
 use kernel::fs::{
-    self, address_space, dentry, dentry::DEntry, file, inode, inode::INode, iomap, mode, sb,
+    self, address_space, dentry, dentry::DEntry, file, file::File, inode, inode::INode, iomap, sb,
     sb::SuperBlock, Offset,
 };
 use kernel::time::Timespec;
 use kernel::types::{ARef, Either, FromBytes, Locked, LE};
-use kernel::{c_str, prelude::*, uapi};
+use kernel::{c_str, prelude::*, uaccess, uapi};
 
 pub mod defs;
 
@@ -21,10 +21,9 @@ kernel::module_fs! {
     license: "GPL",
 }
 
-#[allow(dead_code)]
 struct INodeData {
-    /// first data cluster
-    first_cluster: u32,
+    /// Contains the file's cluster numbers; or [`None`] for empty files or if this is a pre-FAT32 root inode.
+    clusters: Option<KVec<u32>>,
 }
 
 struct FatFs {
@@ -43,15 +42,15 @@ struct FatFs {
     rootdir_entries: u16,
 }
 
-/*/// Convert FAT attribute bits and a mode mask to UNIX mode
-fn fat_attr_to_mode(s: &FatFs, attrs: u8, mask: u16) {
-    if attrs & fat_dentry_attr::READ_ONLY && (!(attrs & fat_dentry_attr::DIRECTORY)) || s.options.rodir) {
-        mode &= ~S_IWUGO;
-    }
-}*/
-
 impl FatFs {
-    fn iget(sb: &SuperBlock<Self>, ino: u32) -> Result<ARef<INode<Self>>> {
+    /// Returns the inode associated with the given directory entry;
+    /// if the entry is [`None`], returns the root inode.
+    /// The entry may not be of type [`FatDirEntryType::Other`].
+    fn iget(
+        sb: &SuperBlock<Self>,
+        ino: u32,
+        entry: Option<&FatDirEntry>,
+    ) -> Result<ARef<INode<Self>>> {
         let s = sb.data();
 
         // Create an inode or find an existing (cached) one.
@@ -60,191 +59,153 @@ impl FatFs {
             Either::Right(new) => new,
         };
 
-        // TODO: this is for the root inode for now
-        //if ino == FAT_ROOT_INO {
-
-        // size in bytes
-        let size: i64;
-        // size in clusters
+        let size;
         let blocks: u64;
-        match s.fat_type {
-            FatType::FAT32 { root_cluster } => {
-                blocks = Self::get_cluster_chain_length(s, root_cluster)?.try_into()?;
-                size = (blocks as i64) * (s.cluster_size as i64);
-            }
-            _ => {
-                size = (s.rootdir_entries as i64) * (FAT_DENTRY_SIZE as i64);
-                // this is what C does: how many 512 byte blocks do we need given we store `size` in clusters of size `cluster_size`?
-                blocks = (size as u64).next_multiple_of(s.cluster_size as u64) / 512;
-            }
-        };
+        let entry_type;
+        let (ctime, mtime, atime);
+        let clusters;
 
-        let first_cluster = match s.fat_type {
-            FatType::FAT32 { root_cluster } => root_cluster,
-            _ => 0, // TODO
+        match entry {
+            None => {
+                match s.fat_type {
+                    FatType::FAT32 { root_cluster } => {
+                        clusters = Some({
+                            let clusters = s.get_cluster_chain(root_cluster)?;
+                            blocks = clusters.len().try_into()?;
+                            clusters
+                        });
+                        size = blocks as i64 * s.cluster_size as i64;
+                    }
+                    _ => {
+                        clusters = None;
+                        size = s.rootdir_entries as i64 * FAT_DENTRY_SIZE as i64;
+                        // This is what `fs/fat/inode.c` does: how many 512 byte blocks do we need given we store `size` in clusters of size `cluster_size`?
+                        blocks = (size as u64).next_multiple_of(s.cluster_size as u64) / 512;
+                    }
+                };
+
+                // Default values for the root inode, which has no directory entry itself.
+                entry_type = FatDirEntryType::Directory;
+
+                let t = Timespec::new(0, 0)?;
+                (ctime, mtime, atime) = (t, t, t);
+            }
+            Some(entry) => {
+                size = unwrap_packed!(entry.file_size).into();
+                clusters = if size == 0 {
+                    blocks = 0;
+                    None
+                } else {
+                    Some({
+                        let clusters = s.get_cluster_chain(entry.first_cluster())?;
+                        blocks = clusters.len().try_into()?;
+                        clusters
+                    })
+                };
+
+                entry_type = entry.typ();
+
+                ctime = entry.ctime()?;
+                mtime = entry.mtime()?;
+                atime = entry.atime()?;
+            }
         };
 
         const DIR_FOPS: file::Ops<FatFs> = file::Ops::new::<FatFs>();
         const DIR_IOPS: inode::Ops<FatFs> = inode::Ops::new::<FatFs>();
         const FILE_AOPS: address_space::Ops<FatFs> = iomap::ro_aops::<FatFs>();
 
-        inode
-            .set_iops(DIR_IOPS)
-            .set_fops(DIR_FOPS)
-            .set_aops(FILE_AOPS);
-
-        // root directory has no entry itself and thus no time
-        let time = Timespec::new(0, 0)?;
+        let mut mode = fs::mode::S_IRUGO; // TODO
+        let typ = match entry_type {
+            FatDirEntryType::File => {
+                mode |= fs::mode::S_IFREG;
+                inode
+                    .set_fops(file::Ops::generic_ro_file())
+                    .set_aops(FILE_AOPS);
+                inode::Type::Reg
+            }
+            FatDirEntryType::Directory => {
+                mode |= fs::mode::S_IFDIR;
+                inode
+                    .set_iops(DIR_IOPS)
+                    .set_fops(DIR_FOPS)
+                    .set_aops(FILE_AOPS);
+                inode::Type::Dir
+            }
+            FatDirEntryType::Other => unreachable!(),
+        };
 
         inode.init(inode::Params {
-            typ: inode::Type::Dir,
-            mode: mode::S_IRUGO,
+            typ,
+            mode,
             size,
             blocks,
-            nlink: 2,
+            nlink: 1,
             uid: 1000, // TODO: get from options
             gid: 1000,
-            ctime: time,
-            mtime: time,
-            atime: time,
-            value: INodeData { first_cluster },
+            ctime,
+            mtime,
+            atime,
+            value: INodeData { clusters },
         })
-        //}
     }
 
-    /// Iterates over the cluster numbers within the cluster chain starting at `first_cluster`.
-    /// If it is not a bad cluster, the first cluster is `first_cluster`.
-    ///
-    /// The iterator ends when the end of the cluster chain is encountered.
-    /// If a bad cluster is encountered, this gives `Err(EIO)` and ends the iteration.
-    fn iter_cluster_chain(&self, first_cluster: u32) -> ClusterIter<'_> {
-        ClusterIter {
-            fs: &self,
-            first_cluster,
-            next_cluster: Some(first_cluster),
-        }
-    }
-
-    /// Calculate the count of clusters in a cluster chain which starts at `first_cluster`.
-    fn get_cluster_chain_length(&self, first_cluster: u32) -> Result<usize, Error> {
-        if let Some((last_index, last)) = self.iter_cluster_chain(first_cluster).enumerate().last()
-        {
-            last?;
-            return Ok(last_index + 1);
-        }
-        unreachable!("ChainIterator always returns at least one element")
-    }
-}
-
-pub(crate) struct Cluster<'a> {
-    fs: &'a FatFs,
-    cluster_number: u32,
-}
-
-impl Cluster<'_> {
-    fn for_each_page<U>(
-        &self,
-        first: Offset,
-        mut cb: impl FnMut(&[u8]) -> Result<Option<U>>,
-    ) -> Result<Option<U>> {
-        // TODO: currently only takes first page into account
-        let first_cluster_sector = ((self.cluster_number - 2)
-            * (self.fs.sectors_per_cluster as u32))
-            + self.fs.first_data_sector;
-        let data = self
-            .fs
-            .mapper
-            .mapped_folio(Offset::from(first_cluster_sector) * Offset::from(self.fs.sector_size))?;
-        let avail = data.len();
-        if first <= Offset::try_from(avail).unwrap() {
-            // TODO: modelled after INode::for_each_page; this makes sense once this iterates over all pages
-            let ret = cb(&data[first as usize..avail])?;
-            if ret.is_some() {
-                return Ok(ret);
-            }
-        }
-        Ok(None)
-    }
-}
-
-/// An iterator over a cluster chain, iterating over all cluster numbers.
-///
-/// Only the last element can be an [`Err`] and at least one element is always returned.
-pub(crate) struct ClusterIter<'a> {
-    fs: &'a FatFs,
-    first_cluster: u32,
-    next_cluster: Option<u32>,
-}
-
-impl ClusterIter<'_> {
     /// Reads the FAT entry for `cluster`. `cluster` is at least 2 and at most `cluster_count + 1`.
-    fn read_fat_entry(&self, cluster: u32) -> Result<FatEntry, Error> {
-        let s = self.fs;
-
-        if !(2 <= cluster && cluster <= s.cluster_count + 1) {
+    fn get_fat_entry(&self, cluster: u32) -> Result<FatEntry> {
+        if !(2 <= cluster && cluster <= self.cluster_count + 1) {
             pr_err!(
                 "cluster {} out of range for {} data clusters\n",
                 cluster,
-                s.cluster_count
+                self.cluster_count
             );
             return Err(EINVAL);
         }
 
-        let sector_size = Offset::from(s.sector_size);
+        let sector_size = Offset::from(self.sector_size);
 
-        let fat_offset = match s.fat_type {
+        let fat_offset = match self.fat_type {
             FatType::FAT32 { root_cluster: _ } => cluster * 4,
             FatType::FAT16 => cluster * 2,
             FatType::FAT12 => todo!(),
         };
-        let fat_sector = s.first_fat_sector + (Offset::from(fat_offset) / sector_size);
-        let entry_offset = fat_offset % u32::from(s.sector_size);
+        let fat_sector = self.first_fat_sector + (Offset::from(fat_offset) / sector_size);
+        let entry_offset = fat_offset % u32::from(self.sector_size);
 
-        let data = s.mapper.mapped_folio(fat_sector * sector_size)?;
+        let data = self.mapper.mapped_folio(fat_sector * sector_size)?;
 
-        match s.fat_type {
+        match self.fat_type {
             FatType::FAT32 { root_cluster: _ } => {
                 let entry = LE::<u32>::from_bytes(&data, entry_offset as usize).ok_or(EIO)?;
-                // ignore high four bits
-                let entry = entry.value() & 0x0FFFFFFF;
-                Ok(FatEntry::from_entry(&s.fat_type, entry))
+                let entry = entry.value() & 0x0FFFFFFF; // ignore high four bits
+                Ok(FatEntry::from_entry(&self.fat_type, entry))
             }
             _ => todo!(),
         }
     }
-}
 
-impl Iterator for ClusterIter<'_> {
-    type Item = Result<u32, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(cluster) = self.next_cluster {
-            match self.read_fat_entry(cluster) {
-                Ok(fat_entry) => match fat_entry {
-                    FatEntry::Next(next) => {
-                        let previous = cluster;
-                        self.next_cluster = Some(next);
-                        Some(Ok(previous))
-                    }
-                    FatEntry::End => {
-                        let previous = cluster;
-                        self.next_cluster = None;
-                        Some(Ok(previous))
-                    }
-                    FatEntry::Bad => {
-                        pr_err!(
-                            "bad cluster chain starting at {} (contains bad cluster {})\n",
-                            self.first_cluster,
-                            cluster
-                        );
-                        self.next_cluster = None;
-                        Some(Err(EIO))
-                    }
-                },
-                Err(e) => Some(Err(e)),
+    fn get_cluster_chain(&self, first_cluster: u32) -> Result<KVec<u32>> {
+        let mut clusters = KVec::new();
+        let mut cluster = first_cluster;
+        // TODO: Detect infinite cluster chain.
+        loop {
+            match self.get_fat_entry(cluster)? {
+                FatEntry::Next(next) => {
+                    clusters.push(cluster, GFP_KERNEL)?;
+                    cluster = next;
+                }
+                FatEntry::End => {
+                    clusters.push(cluster, GFP_KERNEL)?;
+                    return Ok(clusters);
+                }
+                FatEntry::Bad => {
+                    pr_err!(
+                        "bad cluster chain starting at {} (contains bad cluster {})\n",
+                        first_cluster,
+                        cluster
+                    );
+                    return Err(EIO);
+                }
             }
-        } else {
-            None
         }
     }
 }
@@ -372,6 +333,8 @@ impl fs::FileSystem for FatFs {
 
         sb.set_magic(uapi::MSDOS_SUPER_MAGIC as usize);
 
+        // TODO: set `sb->s_time_{min,max}`
+
         drop(mapped);
 
         Ok(KBox::new(
@@ -380,7 +343,7 @@ impl fs::FileSystem for FatFs {
                 fat_type,
                 sector_size,
                 sectors_per_cluster,
-                cluster_size: (sector_size as u32) * (sectors_per_cluster as u32),
+                cluster_size: sector_size as u32 * sectors_per_cluster as u32,
                 cluster_count,
                 first_fat_sector: Offset::from(first_fat_sector),
                 first_data_sector,
@@ -392,7 +355,7 @@ impl fs::FileSystem for FatFs {
 
     #[allow(unused_variables)]
     fn init_root(sb: &SuperBlock<Self>) -> Result<dentry::Root<Self>> {
-        let inode = Self::iget(sb, FAT_ROOT_INO)?;
+        let inode = Self::iget(sb, FAT_ROOT_INO, None)?;
         dentry::Root::try_new(inode)
     }
 }
@@ -401,6 +364,14 @@ impl fs::FileSystem for FatFs {
 impl file::Operations for FatFs {
     type FileSystem = Self;
 
+    fn seek(file: &File<Self>, offset: Offset, whence: file::Whence) -> Result<Offset> {
+        file::generic_seek(file, offset, whence)
+    }
+
+    fn read(_: &File<Self>, _: &mut uaccess::UserSliceWriter, _: &mut Offset) -> Result<usize> {
+        Err(EISDIR)
+    }
+
     fn read_dir(
         _file: &file::File<Self::FileSystem>,
         inode: &kernel::types::Locked<&INode<Self::FileSystem>, inode::ReadSem>,
@@ -408,13 +379,8 @@ impl file::Operations for FatFs {
     ) -> Result {
         let s = inode.super_block().data();
         match s.fat_type {
-            FatType::FAT32 { root_cluster } => {
-                let root_cluster = Cluster {
-                    fs: s,
-                    cluster_number: root_cluster,
-                };
-                // TODO: only takes first page of first cluster into account for now
-                root_cluster.for_each_page(emitter.pos(), |data| {
+            FatType::FAT32 { root_cluster: _ } => {
+                inode.for_each_page(emitter.pos(), Offset::MAX, |data| {
                     let mut offset = 0usize;
                     let mut acc: Offset = 0;
                     let limit = data.len().saturating_sub(FAT_DENTRY_SIZE);
@@ -429,9 +395,10 @@ impl file::Operations for FatFs {
                             FatDirEntryName::Name { short_name, len } => (short_name, len),
                         };
 
-                        let t = match entry.get_type() {
-                            None => continue,
-                            Some(t) => t,
+                        let t = match entry.typ() {
+                            FatDirEntryType::Other => continue,
+                            FatDirEntryType::File => file::DirEntryType::Reg,
+                            FatDirEntryType::Directory => file::DirEntryType::Dir,
                         };
 
                         if !emitter.emit(acc, &name[..name_len], entry.first_cluster().into(), t) {
@@ -453,10 +420,36 @@ impl inode::Operations for FatFs {
     type FileSystem = Self;
 
     fn lookup(
-        _parent: &Locked<&INode<Self::FileSystem>, inode::ReadSem>,
-        _dentry: dentry::Unhashed<'_, Self::FileSystem>,
+        parent: &Locked<&INode<Self::FileSystem>, inode::ReadSem>,
+        dentry: dentry::Unhashed<'_, Self::FileSystem>,
     ) -> Result<Option<ARef<DEntry<Self::FileSystem>>>> {
-        todo!()
+        let inode = parent.for_each_page(0, Offset::MAX, |data| {
+            let mut offset = 0usize;
+            while data.len() - offset > FAT_DENTRY_SIZE {
+                let entry = FatDirEntry::from_bytes(data, offset).ok_or(EIO)?;
+
+                let (name, name_len) = match entry.name() {
+                    FatDirEntryName::Free => continue,
+                    FatDirEntryName::FreeConsecutive => return Ok(None),
+                    FatDirEntryName::Name { short_name, len } => (short_name, len),
+                };
+
+                if &name[..name_len] == dentry.name() {
+                    // TODO: We currently use ino = offset (with ino = FAT_ROOT_INO being the root).
+                    // This works for now, since this is read-only.
+                    return Ok(Some(Self::iget(
+                        parent.super_block(),
+                        offset.try_into().unwrap(),
+                        Some(entry),
+                    )?));
+                }
+
+                offset += FAT_DENTRY_SIZE;
+            }
+            Ok(None)
+        })?;
+
+        dentry.splice_alias(inode)
     }
 }
 
@@ -472,6 +465,39 @@ impl iomap::Operations for FatFs {
         map: &mut iomap::Map<'a>,
         srcmap: &mut iomap::Map<'a>,
     ) -> Result {
-        todo!()
+        let size = inode.size();
+        if pos >= size {
+            map.set_offset(pos)
+                .set_length(length.try_into()?)
+                .set_flags(iomap::map_flags::MERGED)
+                .set_type(iomap::Type::Hole);
+            return Ok(());
+        }
+
+        let cluster_size = inode.super_block().data().cluster_size as Offset;
+        let cluster_index = pos / cluster_size;
+
+        match &inode.data().clusters {
+            Some(clusters) => {
+                let sector_size = inode.super_block().data().sector_size;
+                let sectors_per_cluster = inode.super_block().data().sectors_per_cluster;
+                let first_data_sector = inode.super_block().data().first_data_sector;
+
+                let cluster = clusters[cluster_index as usize] as u64;
+                let first_cluster_sector =
+                    ((cluster - 2) * (sectors_per_cluster as u64)) + first_data_sector as u64;
+                let cluster_offset = first_cluster_sector * sector_size as u64;
+
+                map.set_offset(cluster_index * cluster_size)
+                    .set_length(cluster_size as u64)
+                    .set_flags(iomap::map_flags::MERGED)
+                    .set_type(iomap::Type::Mapped)
+                    .set_bdev(Some(inode.super_block().bdev()))
+                    .set_addr(cluster_offset);
+            }
+            None => unimplemented!(), // TODO: pre-FAT32 root directory
+        };
+
+        Ok(())
     }
 }
