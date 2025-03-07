@@ -10,8 +10,12 @@ use kernel::fs::{
 use kernel::time::Timespec;
 use kernel::types::{ARef, Either, FromBytes, Locked, LE};
 use kernel::{c_str, prelude::*, uaccess, uapi};
+use types::*;
 
 pub mod defs;
+mod time;
+mod types;
+mod utils;
 
 kernel::module_fs! {
     type: FatFs,
@@ -45,11 +49,10 @@ struct FatFs {
 impl FatFs {
     /// Returns the inode associated with the given directory entry;
     /// if the entry is [`None`], returns the root inode.
-    /// The entry may not be of type [`FatDirEntryType::Other`].
     fn iget(
         sb: &SuperBlock<Self>,
         ino: u32,
-        entry: Option<&FatDirEntry>,
+        entry: Option<RegularFatDirEntry<'_>>,
     ) -> Result<ARef<INode<Self>>> {
         let s = sb.data();
 
@@ -61,7 +64,7 @@ impl FatFs {
 
         let size;
         let blocks: u64;
-        let entry_type;
+        let is_file;
         let (ctime, mtime, atime);
         let clusters;
 
@@ -85,13 +88,13 @@ impl FatFs {
                 };
 
                 // Default values for the root inode, which has no directory entry itself.
-                entry_type = FatDirEntryType::Directory;
+                is_file = false;
 
                 let t = Timespec::new(0, 0)?;
                 (ctime, mtime, atime) = (t, t, t);
             }
             Some(entry) => {
-                size = unwrap_packed!(entry.file_size).into();
+                size = entry.file_size().into();
                 clusters = if size == 0 {
                     blocks = 0;
                     None
@@ -103,7 +106,7 @@ impl FatFs {
                     })
                 };
 
-                entry_type = entry.typ();
+                is_file = entry.is_file();
 
                 ctime = entry.ctime()?;
                 mtime = entry.mtime()?;
@@ -116,23 +119,19 @@ impl FatFs {
         const FILE_AOPS: address_space::Ops<FatFs> = iomap::ro_aops::<FatFs>();
 
         let mut mode = fs::mode::S_IRUGO; // TODO
-        let typ = match entry_type {
-            FatDirEntryType::File => {
-                mode |= fs::mode::S_IFREG;
-                inode
-                    .set_fops(file::Ops::generic_ro_file())
-                    .set_aops(FILE_AOPS);
-                inode::Type::Reg
-            }
-            FatDirEntryType::Directory => {
-                mode |= fs::mode::S_IFDIR;
-                inode
-                    .set_iops(DIR_IOPS)
-                    .set_fops(DIR_FOPS)
-                    .set_aops(FILE_AOPS);
-                inode::Type::Dir
-            }
-            FatDirEntryType::Other => unreachable!(),
+        let typ = if is_file {
+            mode |= fs::mode::S_IFREG;
+            inode
+                .set_fops(file::Ops::generic_ro_file())
+                .set_aops(FILE_AOPS);
+            inode::Type::Reg
+        } else {
+            mode |= fs::mode::S_IFDIR;
+            inode
+                .set_iops(DIR_IOPS)
+                .set_fops(DIR_FOPS)
+                .set_aops(FILE_AOPS);
+            inode::Type::Dir
         };
 
         inode.init(inode::Params {
@@ -177,7 +176,7 @@ impl FatFs {
             FatType::FAT32 { root_cluster: _ } => {
                 let entry = LE::<u32>::from_bytes(&data, entry_offset as usize).ok_or(EIO)?;
                 let entry = entry.value() & 0x0FFFFFFF; // ignore high four bits
-                Ok(FatEntry::from_entry(&self.fat_type, entry))
+                Ok(FatEntry::from_bytes(&self.fat_type, entry))
             }
             _ => todo!(),
         }
@@ -241,11 +240,14 @@ impl fs::FileSystem for FatFs {
 
         let mapped = mapper.mapped_folio(0)?;
 
-        let Some(signature) = FatBootSectorSignature::from_bytes(&mapped, 510) else {
+        let Some(signature) = LE::<u16>::from_bytes(&mapped, 510) else {
             pr_err!("failed to read FAT signature\n");
             return Err(EIO);
         };
-        signature.validate()?;
+        if unwrap_packed!(signature) != FAT_BOOT_SECTOR_SIGNATURE {
+            pr_err!("not a FAT volume, signature mismatch\n");
+            return Err(EINVAL);
+        }
 
         let Some(bs) = BootSectorStart::from_bytes(&mapped, 0) else {
             pr_err!("failed to read boot sector\n");
@@ -261,7 +263,6 @@ impl fs::FileSystem for FatFs {
             sector_size,
             sector_size >= 512 && sector_size <= 4096 && sector_size.is_power_of_two()
         );
-
         if sb.min_blocksize(sector_size as i32) != sector_size as i32 {
             pr_err!("sector size {sector_size} not supported\n");
             return Err(EIO);
@@ -385,20 +386,22 @@ impl file::Operations for FatFs {
                     let mut acc: Offset = 0;
                     let limit = data.len().saturating_sub(FAT_DENTRY_SIZE);
                     while offset < limit {
-                        let entry = FatDirEntry::from_bytes(data, offset).ok_or(EIO)?;
                         offset += FAT_DENTRY_SIZE;
                         acc += Offset::try_from(FAT_DENTRY_SIZE)?;
 
-                        let (name, name_len) = match entry.name() {
-                            FatDirEntryName::Free => continue,
-                            FatDirEntryName::FreeConsecutive => return Ok(Some(())),
-                            FatDirEntryName::Name { short_name, len } => (short_name, len),
+                        let entry = match FatDirEntry::from_bytes(data, offset).ok_or(EIO)? {
+                            FatDirEntry::Free => continue,
+                            FatDirEntry::FreeConsecutive => return Ok(None),
+                            FatDirEntry::Entry(entry) => entry,
+                            FatDirEntry::Other => continue,
                         };
 
-                        let t = match entry.typ() {
-                            FatDirEntryType::Other => continue,
-                            FatDirEntryType::File => file::DirEntryType::Reg,
-                            FatDirEntryType::Directory => file::DirEntryType::Dir,
+                        let (name, name_len) = entry.name();
+
+                        let t = if entry.is_file() {
+                            file::DirEntryType::Reg
+                        } else {
+                            file::DirEntryType::Dir
                         };
 
                         if !emitter.emit(acc, &name[..name_len], entry.first_cluster().into(), t) {
@@ -426,14 +429,16 @@ impl inode::Operations for FatFs {
         let inode = parent.for_each_page(0, Offset::MAX, |data| {
             let mut offset = 0usize;
             while data.len() - offset > FAT_DENTRY_SIZE {
-                let entry = FatDirEntry::from_bytes(data, offset).ok_or(EIO)?;
+                offset += FAT_DENTRY_SIZE;
 
-                let (name, name_len) = match entry.name() {
-                    FatDirEntryName::Free => continue,
-                    FatDirEntryName::FreeConsecutive => return Ok(None),
-                    FatDirEntryName::Name { short_name, len } => (short_name, len),
+                let entry = match FatDirEntry::from_bytes(data, offset).ok_or(EIO)? {
+                    FatDirEntry::Free => continue,
+                    FatDirEntry::FreeConsecutive => return Ok(None),
+                    FatDirEntry::Entry(entry) => entry,
+                    FatDirEntry::Other => continue,
                 };
 
+                let (name, name_len) = entry.name();
                 if &name[..name_len] == dentry.name() {
                     // TODO: We currently use ino = offset (with ino = FAT_ROOT_INO being the root).
                     // This works for now, since this is read-only.
@@ -443,8 +448,6 @@ impl inode::Operations for FatFs {
                         Some(entry),
                     )?));
                 }
-
-                offset += FAT_DENTRY_SIZE;
             }
             Ok(None)
         })?;

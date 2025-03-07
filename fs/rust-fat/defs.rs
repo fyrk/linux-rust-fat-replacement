@@ -3,83 +3,20 @@
 //! Definitions of FAT structures.
 
 use core::mem::size_of;
-use kernel::prelude::*;
-use kernel::time::Timespec;
+use kernel::static_assert;
 use kernel::types::LE;
 
 pub(crate) const FAT_ROOT_INO: u32 = 0;
 
+pub(crate) const FAT_BOOT_SECTOR_SIGNATURE: u16 = 0xAA55;
+
 pub(crate) const MIN_FAT16_CLUSTERS: u32 = 4085;
 pub(crate) const MIN_FAT32_CLUSTERS: u32 = 65525;
 
-pub(crate) const FAT_DENTRY_SIZE: usize = size_of::<FatDirEntry>();
+pub(crate) const FAT_DENTRY_SIZE: usize = size_of::<RawFatDirEntry>();
 static_assert!(FAT_DENTRY_SIZE == 32);
-
-#[allow(dead_code)]
-pub(crate) enum FatType {
-    FAT12,
-    FAT16,
-    FAT32 { root_cluster: u32 },
-}
-
-impl FatType {
-    pub(crate) fn from_cluster_count(
-        cluster_count: u32,
-        _first_rootdir_sector: u32,
-        bpb32: &BiosParamBlockFat32,
-    ) -> FatType {
-        if cluster_count < MIN_FAT16_CLUSTERS {
-            FatType::FAT12
-        } else if cluster_count < MIN_FAT32_CLUSTERS {
-            FatType::FAT16
-        } else {
-            let root_cluster = bpb32.root_cluster;
-            FatType::FAT32 {
-                root_cluster: root_cluster.value(),
-            }
-        }
-    }
-}
-
-pub(crate) enum FatEntry {
-    Next(u32),
-    End,
-    Bad,
-}
-
-impl FatEntry {
-    pub(crate) fn from_entry(fat_type: &FatType, entry: u32) -> FatEntry {
-        match fat_type {
-            FatType::FAT12 => {
-                if entry >= 0x0FF8 {
-                    FatEntry::End
-                } else if entry == 0x0FF7 {
-                    FatEntry::Bad
-                } else {
-                    FatEntry::Next(entry)
-                }
-            }
-            FatType::FAT16 => {
-                if entry >= 0xFFF8 {
-                    FatEntry::End
-                } else if entry == 0xFFF7 {
-                    FatEntry::Bad
-                } else {
-                    FatEntry::Next(entry)
-                }
-            }
-            FatType::FAT32 { root_cluster: _ } => {
-                if entry >= 0x0FFFFFF8 {
-                    FatEntry::End
-                } else if entry == 0x0FFFFFF7 {
-                    FatEntry::Bad
-                } else {
-                    FatEntry::Next(entry)
-                }
-            }
-        }
-    }
-}
+pub(crate) const FAT_DENTRY_FREE: u8 = 0xE5;
+pub(crate) const FAT_DENTRY_FREE_CONSECUTIVE: u8 = 0x00;
 
 #[allow(dead_code)]
 pub(crate) mod fat_dentry_attr {
@@ -92,28 +29,6 @@ pub(crate) mod fat_dentry_attr {
     pub(crate) const ARCHIVE: u8 = 0x20;
     pub(crate) const LONG_NAME: u8 = READ_ONLY | HIDDEN | SYSTEM | VOLUME_ID;
     pub(crate) const LONG_NAME_MASK: u8 = LONG_NAME | DIRECTORY | ARCHIVE;
-}
-
-#[macro_export]
-/// Unwrap [`LE`] value from a packed struct.
-///
-/// # Examples
-/// ```
-/// kernel::derive_readable_from_bytes! {
-///     #[repr(C, packed)]
-///     struct SuperBlock {
-///         a: LE<u16>,
-///         b: LE<u64>,
-///     }
-/// }
-///
-/// let a = unwrap_packed!(sb.a);
-/// ```
-macro_rules! unwrap_packed {
-    ($attr:expr) => {{
-        let wrapped = $attr;
-        wrapped.value()
-    }};
 }
 
 kernel::derive_readable_from_bytes! {
@@ -146,7 +61,7 @@ kernel::derive_readable_from_bytes! {
         pub(crate) total_sectors_32: LE<u32>,
     }
 
-    /// directly follows [`BiosParamBlock`] at byte 36 on FAT 32 volume
+    /// directly follows [`BiosParamBlock`] at byte 36 on FAT32 volume
     #[repr(C, packed)]
     pub(crate) struct BiosParamBlockFat32 {
         pub(crate) fat_sectors_32: LE<u32>,
@@ -169,20 +84,14 @@ kernel::derive_readable_from_bytes! {
         pub(crate) fs_type: [u8; 8],
     }
 
-    /// starts at byte 510
-    #[repr(C, packed)]
-    pub(crate) struct FatBootSectorSignature {
-        pub(crate) signature: LE<u16>,
-    }
-
     #[derive(Debug)]
     #[repr(C, packed)]
-    pub(crate) struct FatDirEntry {
+    pub(crate) struct RawFatDirEntry {
         /// name and extension
         /// `short_name[0] == 0xE5` => free
         /// `short_name[0] == 0x00` => free, and following entries also free
         /// `short_name[0] == 0x05` => actually 0xE5
-        pub(crate) short_name: [u8; 11],
+        pub(crate) short_name: [LE<u8>; 11],
         pub(crate) attributes: LE<u8>,
         _reserved: u8,
         /// in centiseconds (0-199)
@@ -198,144 +107,5 @@ kernel::derive_readable_from_bytes! {
         pub(crate) first_cluster_lo: LE<u16>,
         /// in bytes
         pub(crate) file_size: LE<u32>,
-    }
-}
-
-impl FatBootSectorSignature {
-    pub(crate) fn validate(&self) -> Result<()> {
-        match unwrap_packed!(self.signature) {
-            0xAA55 => Ok(()),
-            _ => {
-                pr_err!("not a FAT volume, signature mismatch\n");
-                return Err(EINVAL);
-            }
-        }
-    }
-}
-
-pub(crate) enum FatDirEntryName {
-    /// The directory entry is free.
-    Free,
-    /// This directory entry and all following directory entries are free.
-    FreeConsecutive,
-    /// This is a valid directory entry with this short name.
-    Name { short_name: [u8; 12], len: usize },
-}
-
-pub(crate) enum FatDirEntryType {
-    File,
-    Directory,
-    Other,
-}
-
-const SECONDS_PER_MINUTE: u64 = 60;
-const SECONDS_PER_HOUR: u64 = SECONDS_PER_MINUTE * 60;
-const SECONDS_PER_DAY: u64 = SECONDS_PER_HOUR * 24;
-/// Days between 1970-01-01 and 1980-01-01 (2 leap days).
-const FAT_EPOCH_DAY_SHIFT: u64 = 365 * 10 + 2;
-const FAT_YEAR_2100: u16 = 120;
-/// Cumulative number of days until the respective 1sts in non-leap years.
-#[rustfmt::skip]
-const CUMULATIVE_DAYS_IN_YEAR: [u32; 12] = [
-    // Jan  Feb  Mar  Apr  May  Jun  Jul  Aug  Sep  Oct  Nov  Dec
-	     0,  31,  59,  90, 120, 151, 181, 212, 243, 273, 304, 334,
-];
-
-/// Convert FAT time fields into a [`Timespec`].
-fn timespec_from_fat(date: u16, time: u16, centiseconds: u8) -> Result<Timespec> {
-    let year = date >> 9;
-    let month = ((date >> 5) & 0b1111).clamp(1, 12) - 1;
-    let day = (date & 0b11111).clamp(1, 31) - 1;
-
-    let hour = time >> 11;
-    let minute = ((time >> 5) & 0b111111).clamp(0, 59);
-    let second = (time & 0b11111).clamp(0, 29) * 2 + (centiseconds as u16 / 100);
-
-    let mut leap_days = (year + 3) / 4;
-    if year > FAT_YEAR_2100 {
-        // 2100 is not a leap year
-        leap_days -= 1;
-    }
-    if year % 4 == 0 && year != FAT_YEAR_2100 && month > 2 {
-        leap_days += 1;
-    }
-
-    let sec = 0
-        + SECONDS_PER_DAY
-            * (FAT_EPOCH_DAY_SHIFT
-                + year as u64 * 365
-                + CUMULATIVE_DAYS_IN_YEAR[month as usize] as u64
-                + day as u64
-                + leap_days as u64)
-        + SECONDS_PER_HOUR * hour as u64
-        + SECONDS_PER_MINUTE * minute as u64
-        + second as u64;
-
-    // TODO: time zone offset
-
-    Timespec::new(sec, (centiseconds % 100) as u32 * 10000000)
-}
-
-impl FatDirEntry {
-    pub(crate) fn name(&self) -> FatDirEntryName {
-        let mut name = self.short_name.clone();
-        match self.short_name[0] {
-            0xE5 => return FatDirEntryName::Free,
-            0x00 => return FatDirEntryName::FreeConsecutive,
-            0x05 => name[0] = 0xE5,
-            _ => (),
-        }
-        fn get_name_len(part: &[u8]) -> usize {
-            part.iter().rposition(|x| *x != b' ').map_or(0, |l| l + 1)
-        }
-        let base_len = get_name_len(&name[0..8]);
-        let ext_len = get_name_len(&name[8..11]);
-        let mut short_name = [b' '; 12];
-        short_name[..base_len].copy_from_slice(&name[..base_len]);
-        let len = if ext_len > 0 {
-            short_name[base_len] = b'.';
-            short_name[base_len + 1..base_len + 1 + ext_len].copy_from_slice(&name[8..8 + ext_len]);
-            base_len + 1 + ext_len
-        } else {
-            base_len
-        };
-        FatDirEntryName::Name { short_name, len }
-    }
-
-    pub(crate) fn first_cluster(&self) -> u32 {
-        ((unwrap_packed!(self.first_cluster_hi) as u32) << 16)
-            + (unwrap_packed!(self.first_cluster_lo) as u32)
-    }
-
-    /// Returns the directory entry's type.
-    pub(crate) fn typ(&self) -> FatDirEntryType {
-        let attributes = unwrap_packed!(self.attributes);
-        if attributes & fat_dentry_attr::HIDDEN != 0 {
-            return FatDirEntryType::Other;
-        }
-        if attributes & fat_dentry_attr::DIRECTORY != 0 {
-            return FatDirEntryType::Directory;
-        }
-        FatDirEntryType::File
-    }
-
-    pub(crate) fn ctime(&self) -> Result<Timespec> {
-        timespec_from_fat(
-            unwrap_packed!(self.creation_date),
-            unwrap_packed!(self.creation_time),
-            unwrap_packed!(self.creation_time_cs),
-        )
-    }
-
-    pub(crate) fn mtime(&self) -> Result<Timespec> {
-        timespec_from_fat(
-            unwrap_packed!(self.write_date),
-            unwrap_packed!(self.write_time),
-            0,
-        )
-    }
-
-    pub(crate) fn atime(&self) -> Result<Timespec> {
-        timespec_from_fat(unwrap_packed!(self.access_date), 0, 0)
     }
 }
