@@ -51,13 +51,13 @@ impl FatFs {
     /// if the entry is [`None`], returns the root inode.
     fn iget(
         sb: &SuperBlock<Self>,
-        ino: u32,
+        ino: u64,
         entry: Option<RegularFatDirEntry<'_>>,
     ) -> Result<ARef<INode<Self>>> {
         let s = sb.data();
 
         // Create an inode or find an existing (cached) one.
-        let mut inode: inode::New<Self> = match sb.get_or_create_inode(ino.into())? {
+        let mut inode: inode::New<Self> = match sb.get_or_create_inode(ino)? {
             Either::Left(existing) => return Ok(existing),
             Either::Right(new) => new,
         };

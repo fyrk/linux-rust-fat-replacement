@@ -6,7 +6,7 @@ use core::mem::size_of;
 use kernel::static_assert;
 use kernel::types::LE;
 
-pub(crate) const FAT_ROOT_INO: u32 = 0;
+pub(crate) const FAT_ROOT_INO: u64 = 0;
 
 pub(crate) const FAT_BOOT_SECTOR_SIGNATURE: u16 = 0xAA55;
 
