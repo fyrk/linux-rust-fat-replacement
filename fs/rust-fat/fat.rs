@@ -94,8 +94,7 @@ impl FatFs {
                 (ctime, mtime, atime) = (t, t, t);
             }
             Some(entry) => {
-                size = entry.file_size().into();
-                clusters = if size == 0 {
+                clusters = if entry.file_size() == 0 && entry.is_file() {
                     blocks = 0;
                     None
                 } else {
@@ -104,6 +103,14 @@ impl FatFs {
                         blocks = clusters.len().try_into()?;
                         clusters
                     })
+                };
+
+                size = if entry.is_file() {
+                    entry.file_size().into()
+                } else {
+                    let blocks: i64 = blocks.try_into()?;
+                    let cluster_size: i64 = s.cluster_size.into();
+                    blocks * cluster_size
                 };
 
                 is_file = entry.is_file();
