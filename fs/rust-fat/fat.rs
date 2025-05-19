@@ -11,6 +11,7 @@ use kernel::time::Timespec;
 use kernel::types::{ARef, Either, FromBytes, Locked, LE};
 use kernel::{c_str, prelude::*, uaccess, uapi};
 use types::*;
+use utils::*;
 
 pub mod defs;
 mod time;
@@ -214,6 +215,33 @@ impl FatFs {
             }
         }
     }
+
+    fn parse_utf16_long_entries(
+        entries: &[RegularFatLongDirEntry],
+        dest: &mut KVec<u8>,
+    ) -> Result<()> {
+        // TODO: this assumes the entries are just in reverse order and it does
+        // not check the sequence numbers
+        let chars = char::decode_utf16(
+            entries
+                .iter()
+                .rev()
+                .map(|e| e.name_contents())
+                .flatten()
+                .take_while(|c| *c != 0),
+        );
+
+        for res in chars {
+            let c = res.map_err(|_| EIO)?;
+
+            let pos = dest.len();
+            let empty = [0; 4];
+            dest.extend_from_slice(&empty[0..c.len_utf8()], GFP_KERNEL)?;
+            c.encode_utf8(&mut dest[pos..]);
+        }
+
+        Ok(())
+    }
 }
 
 impl fs::FileSystem for FatFs {
@@ -388,33 +416,56 @@ impl file::Operations for FatFs {
         let s = inode.super_block().data();
         match s.fat_type {
             FatType::FAT32 { root_cluster: _ } => {
+                let mut found_long_entries = KVec::new();
+                let mut long_name_scratch = KVec::new();
+
                 inode.for_each_page(emitter.pos(), Offset::MAX, |data| {
                     let mut offset = 0usize;
                     let mut acc: Offset = 0;
                     let limit = data.len().saturating_sub(FAT_DENTRY_SIZE);
+
                     while offset < limit {
-                        offset += FAT_DENTRY_SIZE;
                         acc += Offset::try_from(FAT_DENTRY_SIZE)?;
 
-                        let entry = match FatDirEntry::from_bytes(data, offset).ok_or(EIO)? {
-                            FatDirEntry::Free => continue,
-                            FatDirEntry::FreeConsecutive => return Ok(None),
-                            FatDirEntry::Entry(entry) => entry,
-                            FatDirEntry::Other => continue,
-                        };
+                        'read: {
+                            let entry = match FatDirEntry::from_bytes(data, offset).ok_or(EIO)? {
+                                FatDirEntry::Free => break 'read,
+                                FatDirEntry::FreeConsecutive => return Ok(None),
+                                FatDirEntry::Entry(entry) => entry,
+                                FatDirEntry::LongEntry(entry) => {
+                                    found_long_entries.push(entry, GFP_KERNEL)?;
+                                    break 'read;
+                                }
+                                FatDirEntry::Other => break 'read,
+                            };
 
-                        let (name, name_len) = entry.name();
+                            let t = if entry.is_file() {
+                                file::DirEntryType::Reg
+                            } else {
+                                file::DirEntryType::Dir
+                            };
 
-                        let t = if entry.is_file() {
-                            file::DirEntryType::Reg
-                        } else {
-                            file::DirEntryType::Dir
-                        };
+                            Self::parse_utf16_long_entries(
+                                &found_long_entries,
+                                &mut long_name_scratch,
+                            )?;
 
-                        if !emitter.emit(acc, &name[..name_len], entry.first_cluster().into(), t) {
-                            return Ok(Some(()));
+                            if !emitter.emit(
+                                acc,
+                                &long_name_scratch,
+                                entry.first_cluster().into(),
+                                t,
+                            ) {
+                                return Ok(Some(()));
+                            }
+                            acc = 0;
+
+                            // clear Vec
+                            clear_kvec(&mut found_long_entries);
+                            clear_kvec(&mut long_name_scratch);
                         }
-                        acc = 0;
+
+                        offset += FAT_DENTRY_SIZE;
                     }
                     Ok(None)
                 })?;
@@ -433,28 +484,41 @@ impl inode::Operations for FatFs {
         parent: &Locked<&INode<Self::FileSystem>, inode::ReadSem>,
         dentry: dentry::Unhashed<'_, Self::FileSystem>,
     ) -> Result<Option<ARef<DEntry<Self::FileSystem>>>> {
+        let mut found_long_entries = KVec::new();
+        let mut long_name_scratch = KVec::new();
+
         let inode = parent.for_each_page(0, Offset::MAX, |data| {
             let mut offset = 0usize;
             while data.len() - offset > FAT_DENTRY_SIZE {
-                offset += FAT_DENTRY_SIZE;
+                'read: {
+                    let entry = match FatDirEntry::from_bytes(data, offset).ok_or(EIO)? {
+                        FatDirEntry::Free => break 'read,
+                        FatDirEntry::FreeConsecutive => return Ok(None),
+                        FatDirEntry::Entry(entry) => entry,
+                        FatDirEntry::LongEntry(entry) => {
+                            found_long_entries.push(entry, GFP_KERNEL)?;
+                            break 'read;
+                        }
+                        FatDirEntry::Other => break 'read,
+                    };
 
-                let entry = match FatDirEntry::from_bytes(data, offset).ok_or(EIO)? {
-                    FatDirEntry::Free => continue,
-                    FatDirEntry::FreeConsecutive => return Ok(None),
-                    FatDirEntry::Entry(entry) => entry,
-                    FatDirEntry::Other => continue,
-                };
+                    Self::parse_utf16_long_entries(&found_long_entries, &mut long_name_scratch)?;
 
-                let (name, name_len) = entry.name();
-                if &name[..name_len] == dentry.name() {
-                    // TODO: We currently use ino = offset (with ino = FAT_ROOT_INO being the root).
-                    // This works for now, since this is read-only.
-                    return Ok(Some(Self::iget(
-                        parent.super_block(),
-                        offset.try_into().unwrap(),
-                        Some(entry),
-                    )?));
+                    if &long_name_scratch == dentry.name() {
+                        // TODO: We currently use ino = offset (with ino = FAT_ROOT_INO being the root).
+                        // This works for now, since this is read-only.
+                        return Ok(Some(Self::iget(
+                            parent.super_block(),
+                            offset.try_into().unwrap(),
+                            Some(entry),
+                        )?));
+                    }
+
+                    clear_kvec(&mut found_long_entries);
+                    clear_kvec(&mut long_name_scratch);
                 }
+
+                offset += FAT_DENTRY_SIZE;
             }
             Ok(None)
         })?;

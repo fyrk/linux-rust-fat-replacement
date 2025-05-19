@@ -82,7 +82,9 @@ pub(crate) enum FatDirEntry<'a> {
     FreeConsecutive,
     /// This is an occupied entry of either a file or directory.
     Entry(RegularFatDirEntry<'a>),
-    /// TODO: This is some other entry (placeholder for long names).
+    /// This is an long entry that contaisn part of a name of a following entry.
+    LongEntry(RegularFatLongDirEntry),
+    /// TODO: This is some other entry
     Other,
 }
 
@@ -94,7 +96,13 @@ impl<'a> FatDirEntry<'a> {
             FAT_DENTRY_FREE_CONSECUTIVE => return Some(FatDirEntry::FreeConsecutive),
             _ => (),
         }
+
         let attributes = entry.attributes.value();
+        if attributes & fat_dentry_attr::LONG_NAME != 0 {
+            return Some(FatDirEntry::LongEntry(RegularFatLongDirEntry(
+                RawFatLongDirEntry::from_bytes(data, offset)?.clone(),
+            )));
+        }
         if attributes & (fat_dentry_attr::SYSTEM | fat_dentry_attr::VOLUME_ID) != 0 {
             return Some(FatDirEntry::Other);
         }
@@ -105,6 +113,7 @@ impl<'a> FatDirEntry<'a> {
 pub(crate) struct RegularFatDirEntry<'a>(&'a RawFatDirEntry);
 
 impl RegularFatDirEntry<'_> {
+    #[allow(unused)]
     pub(crate) fn name(&self) -> ([u8; 12], usize) {
         let mut name = self.0.short_name.map(|x| x.value());
         if name[0] == 0x05 {
@@ -160,5 +169,24 @@ impl RegularFatDirEntry<'_> {
 
     pub(crate) fn atime(&self) -> Result<Timespec> {
         timespec_from_fat(unwrap_packed!(self.0.access_date), 0, 0)
+    }
+}
+
+pub(crate) struct RegularFatLongDirEntry(RawFatLongDirEntry);
+
+impl RegularFatLongDirEntry {
+    pub(crate) fn name_contents(&self) -> [u16; FAT_MAX_LONG_DIR_CHARS] {
+        let mut contents = [0; FAT_MAX_LONG_DIR_CHARS];
+        for i in 0..5 {
+            contents[i] = unwrap_packed!(self.0.name_section1[i]);
+        }
+        for i in 5..11 {
+            contents[i] = unwrap_packed!(self.0.name_section2[i - 5]);
+        }
+        for i in 11..13 {
+            contents[i] = unwrap_packed!(self.0.name_section3[i - 11]);
+        }
+
+        contents
     }
 }

@@ -17,6 +17,8 @@ pub(crate) const FAT_DENTRY_SIZE: usize = size_of::<RawFatDirEntry>();
 static_assert!(FAT_DENTRY_SIZE == 32);
 pub(crate) const FAT_DENTRY_FREE: u8 = 0xE5;
 pub(crate) const FAT_DENTRY_FREE_CONSECUTIVE: u8 = 0x00;
+static_assert!(size_of::<RawFatLongDirEntry>() == FAT_DENTRY_SIZE);
+pub(crate) const FAT_MAX_LONG_DIR_CHARS: usize = 13;
 
 #[allow(dead_code)]
 pub(crate) mod fat_dentry_attr {
@@ -107,5 +109,18 @@ kernel::derive_readable_from_bytes! {
         pub(crate) first_cluster_lo: LE<u16>,
         /// in bytes
         pub(crate) file_size: LE<u32>,
+    }
+
+    #[derive(Debug, Clone)]
+    #[repr(C, packed)]
+    pub(crate) struct RawFatLongDirEntry {
+        pub(crate) sequence_number: LE<u8>,
+        pub(crate) name_section1: [LE<u16>; 5],
+        pub(crate) attributes: LE<u8>,
+        pub(crate) long_entry_type: LE<u8>,
+        pub(crate) checksum: LE<u8>,
+        pub(crate) name_section2: [LE<u16>; 6],
+        _zero: [u8; 2],
+        pub(crate) name_section3: [LE<u16>; 2],
     }
 }
