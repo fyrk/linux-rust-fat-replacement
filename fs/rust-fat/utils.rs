@@ -20,14 +20,3 @@ macro_rules! unwrap_packed {
         wrapped.value()
     }};
 }
-
-pub(crate) fn clear_kvec<T>(vec: &mut kernel::alloc::KVec<T>) {
-    let elems: *mut [T] = vec.as_mut_slice();
-
-    // SAFETY:
-    // see alloc::vec::Vec::clear
-    unsafe {
-        vec.set_len(0);
-        core::ptr::drop_in_place(elems);
-    }
-}
