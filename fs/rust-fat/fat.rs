@@ -444,17 +444,19 @@ impl file::Operations for FatFs {
                                 file::DirEntryType::Dir
                             };
 
-                            Self::parse_utf16_long_entries(
-                                &found_long_entries,
-                                &mut long_name_scratch,
-                            )?;
+                            let short_name = entry.name();
 
-                            if !emitter.emit(
-                                acc,
-                                &long_name_scratch,
-                                entry.first_cluster().into(),
-                                t,
-                            ) {
+                            let name = if found_long_entries.is_empty() {
+                                &short_name.0[..short_name.1]
+                            } else {
+                                Self::parse_utf16_long_entries(
+                                    &found_long_entries,
+                                    &mut long_name_scratch,
+                                )?;
+                                &*long_name_scratch
+                            };
+
+                            if !emitter.emit(acc, &name, entry.first_cluster().into(), t) {
                                 return Ok(Some(()));
                             }
                             acc = 0;
