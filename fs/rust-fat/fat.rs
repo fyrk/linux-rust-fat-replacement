@@ -11,7 +11,6 @@ use kernel::time::Timespec;
 use kernel::types::{ARef, Either, FromBytes, Locked, LE};
 use kernel::{c_str, prelude::*, uaccess, uapi};
 use types::*;
-use utils::*;
 
 pub mod defs;
 mod time;
@@ -461,8 +460,8 @@ impl file::Operations for FatFs {
                             acc = 0;
 
                             // clear Vec
-                            clear_kvec(&mut found_long_entries);
-                            clear_kvec(&mut long_name_scratch);
+                            found_long_entries.clear();
+                            long_name_scratch.clear();
                         }
 
                         offset += FAT_DENTRY_SIZE;
@@ -514,8 +513,8 @@ impl inode::Operations for FatFs {
                         )?));
                     }
 
-                    clear_kvec(&mut found_long_entries);
-                    clear_kvec(&mut long_name_scratch);
+                    found_long_entries.clear();
+                    long_name_scratch.clear();
                 }
 
                 offset += FAT_DENTRY_SIZE;
