@@ -44,6 +44,8 @@ struct FatFs {
     first_fat_sector: Offset,
     first_data_sector: u32,
     rootdir_entries: u16,
+    num_fats: u8,
+    fat_sectors: u32,
 }
 
 impl FatFs {
@@ -183,6 +185,11 @@ impl FatFs {
             FatType::FAT32 { root_cluster: _ } => {
                 let entry = LE::<u32>::from_bytes(&data, entry_offset as usize).ok_or(EIO)?;
                 let entry = entry.value() & 0x0FFFFFFF; // ignore high four bits
+                Ok(FatEntry::from_bytes(&self.fat_type, entry))
+            }
+            FatType::FAT16 => {
+                let entry = LE::<u16>::from_bytes(&data, entry_offset as usize).ok_or(EIO)?;
+                let entry = entry.value() as u32;
                 Ok(FatEntry::from_bytes(&self.fat_type, entry))
             }
             _ => todo!(),
@@ -383,6 +390,8 @@ impl fs::FileSystem for FatFs {
                 first_fat_sector: Offset::from(first_fat_sector),
                 first_data_sector,
                 rootdir_entries,
+                num_fats,
+                fat_sectors,
             },
             GFP_KERNEL,
         )?)
@@ -413,8 +422,9 @@ impl file::Operations for FatFs {
         emitter: &mut file::DirEmitter,
     ) -> Result {
         let s = inode.super_block().data();
+        // TODO: this match might not be required
         match s.fat_type {
-            FatType::FAT32 { root_cluster: _ } => {
+            FatType::FAT32 { root_cluster: _ } | FatType::FAT16 => {
                 let mut found_long_entries = KVec::new();
                 let mut long_name_scratch = KVec::new();
 
@@ -549,29 +559,37 @@ impl iomap::Operations for FatFs {
             return Ok(());
         }
 
-        let cluster_size = inode.super_block().data().cluster_size as Offset;
+        let fat_data = inode.super_block().data();
+        let sector_size = fat_data.sector_size;
+
+        let cluster_size = fat_data.cluster_size as Offset;
         let cluster_index = pos / cluster_size;
 
-        match &inode.data().clusters {
+        let cluster_offset = match &inode.data().clusters {
             Some(clusters) => {
-                let sector_size = inode.super_block().data().sector_size;
-                let sectors_per_cluster = inode.super_block().data().sectors_per_cluster;
-                let first_data_sector = inode.super_block().data().first_data_sector;
+                let sectors_per_cluster = fat_data.sectors_per_cluster;
+                let first_data_sector = fat_data.first_data_sector;
 
                 let cluster = clusters[cluster_index as usize] as u64;
                 let first_cluster_sector =
                     ((cluster - 2) * (sectors_per_cluster as u64)) + first_data_sector as u64;
-                let cluster_offset = first_cluster_sector * sector_size as u64;
-
-                map.set_offset(cluster_index * cluster_size)
-                    .set_length(cluster_size as u64)
-                    .set_flags(iomap::map_flags::MERGED)
-                    .set_type(iomap::Type::Mapped)
-                    .set_bdev(Some(inode.super_block().bdev()))
-                    .set_addr(cluster_offset);
+                first_cluster_sector * sector_size as u64
             }
-            None => unimplemented!(), // TODO: pre-FAT32 root directory
+            None => {
+                // FAT-12/16 root directory
+                let first_rootdir_sector = (fat_data.first_fat_sector as u64)
+                    + ((fat_data.num_fats as u64) * fat_data.fat_sectors as u64);
+                (first_rootdir_sector * sector_size as u64) + (cluster_index * cluster_size) as u64
+            }
         };
+
+        map.set_offset(cluster_index * cluster_size)
+            // TODO: this length might be wrong
+            .set_length(cluster_size as u64)
+            .set_flags(iomap::map_flags::MERGED)
+            .set_type(iomap::Type::Mapped)
+            .set_bdev(Some(inode.super_block().bdev()))
+            .set_addr(cluster_offset);
 
         Ok(())
     }
