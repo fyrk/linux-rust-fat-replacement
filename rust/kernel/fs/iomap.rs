@@ -279,3 +279,163 @@ pub const fn ro_aops<T: Operations + ?Sized>() -> address_space::Ops<T::FileSyst
     }
     address_space::Ops(&Table::<T>::TABLE, PhantomData)
 }
+
+/// Returns address space oprerations backed by iomaps for writing.
+pub const fn rw_aops<T: Operations + ?Sized>() -> address_space::Ops<T::FileSystem> {
+    struct Table<T: Operations + ?Sized>(PhantomData<T>);
+    impl<T: Operations + ?Sized> Table<T> {
+        const MAP_TABLE: bindings::iomap_ops = bindings::iomap_ops {
+            iomap_begin: Some(Self::iomap_begin_callback),
+            iomap_end: Some(Self::iomap_end_callback),
+        };
+
+        extern "C" fn iomap_begin_callback(
+            inode_ptr: *mut bindings::inode,
+            pos: Offset,
+            length: Offset,
+            flags: u32,
+            map: *mut bindings::iomap,
+            srcmap: *mut bindings::iomap,
+        ) -> i32 {
+            from_result(|| {
+                // SAFETY: The C API guarantees that `inode_ptr` is a valid inode.
+                let inode = unsafe { INode::from_raw(inode_ptr) };
+                T::begin(
+                    inode,
+                    pos,
+                    length,
+                    flags,
+                    // SAFETY: The C API guarantees that `map` is valid for write.
+                    unsafe { &mut *map.cast::<Map<'_>>() },
+                    // SAFETY: The C API guarantees that `srcmap` is valid for write.
+                    unsafe { &mut *srcmap.cast::<Map<'_>>() },
+                )?;
+                Ok(0)
+            })
+        }
+
+        extern "C" fn iomap_end_callback(
+            inode_ptr: *mut bindings::inode,
+            pos: Offset,
+            length: Offset,
+            written: isize,
+            flags: u32,
+            map: *mut bindings::iomap,
+        ) -> i32 {
+            from_result(|| {
+                // SAFETY: The C API guarantees that `inode_ptr` is a valid inode.
+                let inode = unsafe { INode::from_raw(inode_ptr) };
+                // SAFETY: The C API guarantees that `map` is valid for read.
+                T::end(inode, pos, length, written, flags, unsafe {
+                    &*map.cast::<Map<'_>>()
+                })?;
+                Ok(0)
+            })
+        }
+
+        const TABLE: bindings::address_space_operations = bindings::address_space_operations {
+            writepage: None,
+            read_folio: Some(Self::read_folio_callback),
+            writepages: None,
+            dirty_folio: Some(bindings::iomap_dirty_folio),
+            readahead: Some(Self::readahead_callback),
+            write_begin: Some(Self::write_begin_callback),
+            write_end: Some(Self::write_end_callback),
+            bmap: Some(Self::bmap_callback),
+            invalidate_folio: Some(bindings::iomap_invalidate_folio),
+            release_folio: Some(bindings::iomap_release_folio),
+            free_folio: None,
+            direct_IO: Some(bindings::noop_direct_IO),
+            migrate_folio: None,
+            launder_folio: None,
+            is_partially_uptodate: Some(bindings::iomap_is_partially_uptodate),
+            is_dirty_writeback: None,
+            error_remove_folio: None,
+            swap_activate: None,
+            swap_deactivate: None,
+            swap_rw: None,
+        };
+
+        extern "C" fn read_folio_callback(
+            _file: *mut bindings::file,
+            folio: *mut bindings::folio,
+        ) -> i32 {
+            // SAFETY: `folio` is just forwarded from C and `Self::MAP_TABLE` is always valid.
+            unsafe { bindings::iomap_read_folio(folio, &Self::MAP_TABLE) }
+        }
+
+        extern "C" fn readahead_callback(rac: *mut bindings::readahead_control) {
+            // SAFETY: `rac` is just forwarded from C and `Self::MAP_TABLE` is always valid.
+            unsafe { bindings::iomap_readahead(rac, &Self::MAP_TABLE) }
+        }
+
+        extern "C" fn bmap_callback(mapping: *mut bindings::address_space, block: u64) -> u64 {
+            // SAFETY: `mapping` is just forwarded from C and `Self::MAP_TABLE` is always valid.
+            unsafe { bindings::iomap_bmap(mapping, block, &Self::MAP_TABLE) }
+        }
+
+        // ``write_begin``
+        // 	Called by the generic buffered write code to ask the filesystem
+        // 	to prepare to write len bytes at the given offset in the file.
+        // 	The address_space should check that the write will be able to
+        // 	complete, by allocating space if necessary and doing any other
+        // 	internal housekeeping.  If the write will update parts of any
+        // 	basic-blocks on storage, then those blocks should be pre-read
+        // 	(if they haven't been read already) so that the updated blocks
+        // 	can be written out properly.
+
+        // 	The filesystem must return the locked pagecache folio for the
+        // 	specified offset, in ``*foliop``, for the caller to write into.
+
+        // 	It must be able to cope with short writes (where the length
+        // 	passed to write_begin is greater than the number of bytes copied
+        // 	into the folio).
+
+        // 	A void * may be returned in fsdata, which then gets passed into
+        // 	write_end.
+
+        // 	Returns 0 on success; < 0 on failure (which is the error code),
+        // 	in which case write_end is not called.
+        #[allow(unused)]
+        extern "C" fn write_begin_callback(
+            file: *mut bindings::file,
+            mapping: *mut bindings::address_space,
+            pos: bindings::loff_t,
+            len: ffi::c_uint,
+            foliop: *mut *mut bindings::folio,
+            fsdata: *mut *mut ffi::c_void,
+        ) -> ffi::c_int {
+            from_result(|| {
+                panic!("write_begin pos={pos}, len={len}");
+                Ok(0)
+            })
+        }
+
+        // ``write_end``
+        // 	After a successful write_begin, and data copy, write_end must be
+        // 	called.  len is the original len passed to write_begin, and
+        // 	copied is the amount that was able to be copied.
+
+        // 	The filesystem must take care of unlocking the folio,
+        // 	decrementing its refcount, and updating i_size.
+
+        // 	Returns < 0 on failure, otherwise the number of bytes (<=
+        // 	'copied') that were able to be copied into pagecache.
+        #[allow(unused)]
+        extern "C" fn write_end_callback(
+            file: *mut bindings::file,
+            mapping: *mut bindings::address_space,
+            pos: bindings::loff_t,
+            len: ffi::c_uint,
+            copied: ffi::c_uint,
+            folio: *mut bindings::folio,
+            fsdata: *mut ffi::c_void,
+        ) -> ffi::c_int {
+            from_result(|| {
+                panic!("write_end pos={pos}, len={len}, copied={copied}");
+                Ok(0)
+            })
+        }
+    }
+    address_space::Ops(&Table::<T>::TABLE, PhantomData)
+}

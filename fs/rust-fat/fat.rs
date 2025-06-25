@@ -125,14 +125,16 @@ impl FatFs {
 
         const DIR_FOPS: file::Ops<FatFs> = file::Ops::new::<FatFs>();
         const DIR_IOPS: inode::Ops<FatFs> = inode::Ops::new::<FatFs>();
-        const FILE_AOPS: address_space::Ops<FatFs> = iomap::ro_aops::<FatFs>();
+        // const FILE_AOPS: address_space::Ops<FatFs> = iomap::ro_aops::<FatFs>();
+        const FILE_AOPS: address_space::Ops<FatFs> = iomap::rw_aops::<FatFs>();
 
         let mut mode = fs::mode::S_IRUGO; // TODO
         let typ = if is_file {
             mode |= fs::mode::S_IFREG;
-            inode
-                .set_fops(file::Ops::generic_ro_file())
-                .set_aops(FILE_AOPS);
+            mode |= fs::mode::S_IWUSR;
+            // let file_ops = file::Ops::generic_ro_file();
+
+            inode.set_fops(DIR_FOPS).set_aops(FILE_AOPS);
             inode::Type::Reg
         } else {
             mode |= fs::mode::S_IFDIR;
@@ -412,8 +414,73 @@ impl file::Operations for FatFs {
         file::generic_seek(file, offset, whence)
     }
 
-    fn read(_: &File<Self>, _: &mut uaccess::UserSliceWriter, _: &mut Offset) -> Result<usize> {
-        Err(EISDIR)
+    fn read(
+        file: &File<Self>,
+        writer: &mut uaccess::UserSliceWriter,
+        offset: &mut Offset,
+    ) -> Result<usize> {
+        let size = file.inode().size();
+        if *offset > size {
+            return Ok(0);
+        }
+
+        let mut rem = (size - *offset) as usize;
+
+        let folio = unsafe { file.inode().mapped_folio(*offset)? };
+        let len = folio.len();
+
+        rem = rem.min(len);
+
+        pr_info!("folio offset={offset} len={len}, rem={rem}");
+
+        writer.write_slice(&folio[..rem])?;
+        *offset += rem as i64;
+        Ok(rem)
+    }
+
+    fn write(
+        file: &File<Self>,
+        reader: uaccess::UserSliceReader,
+        offset: &mut Offset,
+    ) -> Result<usize> {
+        let size = file.inode().size();
+
+        pr_info!("write called offset={offset}, size={size}");
+
+        if *offset != 0 {
+            panic!("Tried to write at non zero offset {offset}");
+        }
+
+        // if reader.len() as i64 != size {
+        //     panic!(
+        //         "Tried to write diffrent length {} than current size {size}",
+        //         reader.len()
+        //     );
+        // }
+
+        // if *offset > size {
+        //     return Ok(0);
+        // }
+
+        // let mut rem = (size - *offset) as usize;
+
+        let mut buf = KVec::new();
+        reader.read_all(&mut buf, GFP_KERNEL)?;
+        pr_info!("Writing {} bytes", buf.len());
+
+        let mut mapped = unsafe { file.inode().mapped_folio(*offset)? };
+        let mut folio = mapped.lock();
+        // maybe wrong lol
+        folio.mark_uptodate();
+        let err = folio.write(*offset as usize, &buf);
+        pr_info!("folio write res {err:?}");
+        err?;
+
+        *offset += buf.len() as i64;
+
+        pr_info!("offset={offset}");
+
+        Ok(buf.len())
     }
 
     fn read_dir(
@@ -548,8 +615,10 @@ impl iomap::Operations for FatFs {
         length: Offset,
         flags: u32,
         map: &mut iomap::Map<'a>,
-        srcmap: &mut iomap::Map<'a>,
+        _srcmap: &mut iomap::Map<'a>,
     ) -> Result {
+        pr_info!("iomap::start called pos={pos}, len={length}, flags={flags}");
+
         let size = inode.size();
         if pos >= size {
             map.set_offset(pos)
@@ -591,6 +660,18 @@ impl iomap::Operations for FatFs {
             .set_bdev(Some(inode.super_block().bdev()))
             .set_addr(cluster_offset);
 
+        Ok(())
+    }
+
+    fn end<'a>(
+        _inode: &'a INode<Self::FileSystem>,
+        pos: Offset,
+        length: Offset,
+        written: isize,
+        flags: u32,
+        _map: &iomap::Map<'a>,
+    ) -> Result {
+        pr_info!("iomap::end called pos={pos}, len={length}, written={written}, flags={flags}");
         Ok(())
     }
 }

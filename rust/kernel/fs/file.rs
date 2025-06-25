@@ -11,6 +11,7 @@ use super::{dentry::DEntry, inode, inode::INode, inode::Ino, FileSystem, Offset,
 use crate::{
     bindings,
     error::{code::*, from_result, Error, Result},
+    pr_info,
     types::{ARef, AlwaysRefCounted, Locked, Opaque},
     uaccess,
 };
@@ -339,6 +340,15 @@ pub trait Operations {
         Err(EINVAL)
     }
 
+    /// bruch
+    fn write(
+        _file: &File<Self::FileSystem>,
+        _buffer: uaccess::UserSliceReader,
+        _offset: &mut Offset,
+    ) -> Result<usize> {
+        Err(EINVAL)
+    }
+
     /// Reads directory entries from directory files.
     ///
     /// [`DirEmitter::pos`] holds the current position of the directory reader.
@@ -378,8 +388,12 @@ impl<T: FileSystem + ?Sized> Ops<T> {
                 } else {
                     None
                 },
-                write: None,
-                read_iter: None,
+                write: if T::HAS_WRITE {
+                    Some(Self::write_callback)
+                } else {
+                    None
+                },
+                read_iter: Some(bindings::generic_file_read_iter),
                 write_iter: None,
                 iopoll: None,
                 iterate_shared: if T::HAS_READ_DIR {
@@ -390,7 +404,7 @@ impl<T: FileSystem + ?Sized> Ops<T> {
                 poll: None,
                 unlocked_ioctl: None,
                 compat_ioctl: None,
-                mmap: None,
+                mmap: Some(bindings::generic_file_readonly_mmap),
                 open: None,
                 flush: None,
                 release: None,
@@ -401,7 +415,7 @@ impl<T: FileSystem + ?Sized> Ops<T> {
                 check_flags: None,
                 flock: None,
                 splice_write: None,
-                splice_read: None,
+                splice_read: Some(bindings::filemap_splice_read),
                 splice_eof: None,
                 setlease: None,
                 fallocate: None,
@@ -441,8 +455,33 @@ impl<T: FileSystem + ?Sized> Ops<T> {
                     let mut writer = uaccess::UserSlice::new(ptr as usize, len).writer();
 
                     // SAFETY: The C API guarantees that `offset` is valid for read and write.
-                    let read = T::read(file, &mut writer, unsafe { &mut *offset })?;
+                    let read = T::read(file, &mut writer, unsafe { offset.as_mut().unwrap() })?;
                     Ok(isize::try_from(read)?)
+                })
+            }
+
+            unsafe extern "C" fn write_callback(
+                file_ptr: *mut bindings::file,
+                ptr: *const ffi::c_char,
+                len: usize,
+                offset: *mut bindings::loff_t,
+            ) -> isize {
+                from_result(|| {
+                    pr_info!("Before write len={len}, offset={}", unsafe { *offset });
+                    // SAFETY: The C API guarantees that `file` is valid for the duration of the
+                    // callback. Since this callback is specifically for filesystem T, we know `T`
+                    // is the right filesystem.
+                    let file = unsafe { File::from_raw(file_ptr) };
+                    let reader = uaccess::UserSlice::new(ptr as usize, len).reader();
+
+                    // SAFETY: The C API guarantees that `offset` is valid for read and write.
+                    let write = T::write(file, reader, unsafe { offset.as_mut().unwrap() })?;
+                    pr_info!("After write len={len}, offset={}, write={write}", unsafe {
+                        *offset
+                    });
+                    pr_info!("===");
+
+                    Ok(isize::try_from(write)?)
                 })
             }
 

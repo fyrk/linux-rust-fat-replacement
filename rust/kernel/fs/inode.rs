@@ -351,10 +351,27 @@ unsafe impl<T: FileSystem + ?Sized> Lockable<ReadSem> for INode<T> {
 
     unsafe fn unlock(&self) {
         // SAFETY: Since there's a reference to the inode, it must be valid. Additionally, the
-        // safety requirements of this functino require that the inode be locked in read mode.
+        // safety requirements of this function require that the inode be locked in read mode.
         unsafe { bindings::inode_unlock_shared(self.0.get()) };
     }
 }
+
+// /// Indicates that the an inode's rw semapahore is locked in write (exclusive) mode.
+// pub struct WriteSem;
+
+// // SAFETY: `raw_lock` calls `inode_lock` which locks the inode in exclusive mode.
+// unsafe impl<T: FileSystem + ?Sized> Lockable<WriteSem> for INode<T> {
+//     fn raw_lock(&self) {
+//         // SAFETY: Since there's a reference to the inode, it must be valid.
+//         unsafe { bindings::inode_lock(self.0.get()) };
+//     }
+
+//     unsafe fn unlock(&self) {
+//         // SAFETY: Since there's a reference to the inode, it must be valid. Additionally, the
+//         // safety requirements of this function require that the inode be locked in write mode.
+//         unsafe { bindings::inode_unlock(self.0.get()) };
+//     }
+// }
 
 struct WithData<T> {
     data: MaybeUninit<T>,

@@ -60,6 +60,9 @@ pub mod mode {
 
     /// Mode that grants read access to everyone.
     pub const S_IRUGO: u16 = bindings::S_IRUGO as u16;
+
+    /// Mode that grants write access to owner.
+    pub const S_IWUSR: u16 = bindings::S_IWUSR as u16;
 }
 
 /// Maximum size of an inode.
@@ -285,7 +288,7 @@ impl<T: FileSystem + ?Sized> Tables<T> {
             let sb = unsafe { &mut *new_sb.0.get() };
             sb.s_op = &Tables::<T>::SUPER_BLOCK;
             sb.s_xattr = &Tables::<T>::XATTR_HANDLERS[0];
-            sb.s_flags |= bindings::SB_RDONLY;
+            // sb.s_flags |= bindings::SB_RDONLY;
 
             let mapper = if matches!(T::SUPER_TYPE, sb::Type::BlockDev) {
                 // SAFETY: This is the only mapper created for this inode, so it is unique.

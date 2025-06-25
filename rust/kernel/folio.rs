@@ -6,6 +6,7 @@
 
 use crate::error::{code::*, Result};
 use crate::fs::{self, inode::INode, FileSystem};
+use crate::pr_info;
 use crate::types::{self, ARef, AlwaysRefCounted, Locked, Opaque, ScopeGuard};
 use core::{cmp::min, marker::PhantomData, ops::Deref, ptr};
 
@@ -97,7 +98,7 @@ impl<S> Folio<S> {
         let data_len = guard.len();
         core::mem::forget(guard);
         Ok(Mapped {
-            _folio: folio,
+            folio: folio,
             to_unmap,
             data,
             data_len,
@@ -161,7 +162,7 @@ impl<T: FileSystem + ?Sized> Folio<PageCache<T>> {
 /// `to_unmap` is a mapped page of the folio. The byte range starting at `data` and extending for
 /// `data_len` bytes is within the mapped page.
 pub struct Mapped<'a, S = Unspecified> {
-    _folio: ARef<Folio<S>>,
+    folio: ARef<Folio<S>>,
     to_unmap: *mut bindings::page,
     data: *const u8,
     data_len: usize,
@@ -173,6 +174,15 @@ impl<S> Mapped<'_, S> {
     pub fn cap_len(&mut self, new_len: usize) {
         if new_len < self.data_len {
             self.data_len = new_len;
+        }
+    }
+
+    /// giga bruch
+    pub fn lock<'a>(&'a mut self) -> Locked<FolioGuard<'a, S>> {
+        unsafe {
+            Locked::new(FolioGuard {
+                folio: &mut self.folio,
+            })
         }
     }
 }
@@ -215,6 +225,19 @@ impl Drop for MapGuard<'_> {
     }
 }
 
+/// locked folio
+pub struct FolioGuard<'a, S> {
+    folio: &'a mut ARef<Folio<S>>,
+}
+
+impl<S> Deref for FolioGuard<'_, S> {
+    type Target = Folio<S>;
+
+    fn deref(&self) -> &Self::Target {
+        self.folio
+    }
+}
+
 // SAFETY: `raw_lock` calls folio_lock, which actually locks the folio.
 unsafe impl<S> types::Lockable for Folio<S> {
     fn raw_lock(&self) {
@@ -248,9 +271,19 @@ impl<T: Deref<Target = Folio<S>>, S> Locked<T> {
         let mut remaining = len;
         let mut next_offset = offset;
 
-        if self.test_uptodate() {
+        let uptodate = self.test_uptodate();
+
+        pr_info!(
+            "Check up to date on folio pos {}, size {}, uptodate {uptodate}",
+            self.pos(),
+            self.size()
+        );
+
+        if !uptodate {
             return Err(EIO);
         }
+
+        pr_info!("Folio is up to date");
 
         // Check that we don't overflow the folio.
         let end = offset.checked_add(len).ok_or(EDOM)?;
