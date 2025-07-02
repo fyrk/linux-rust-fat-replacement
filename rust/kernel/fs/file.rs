@@ -476,9 +476,12 @@ impl<T: FileSystem + ?Sized> Ops<T> {
 
                     // SAFETY: The C API guarantees that `offset` is valid for read and write.
                     let write = T::write(file, reader, unsafe { offset.as_mut().unwrap() })?;
-                    pr_info!("After write len={len}, offset={}, write={write}", unsafe {
-                        *offset
-                    });
+
+                    pr_info!(
+                        "After write len={len}, offset={}, write={write}, size={}",
+                        unsafe { *offset },
+                        file.inode().size()
+                    );
                     pr_info!("===");
 
                     Ok(isize::try_from(write)?)

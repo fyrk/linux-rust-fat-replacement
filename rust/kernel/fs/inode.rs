@@ -110,6 +110,12 @@ impl<T: FileSystem + ?Sized> INode<T> {
         unsafe { bindings::i_size_read(self.0.get()) }
     }
 
+    /// bruch
+    pub fn set_size(&self, size: Offset) {
+        // SAFETY: `self` is guaranteed to be valid by the existence of a shared reference.
+        unsafe { bindings::i_size_write(self.0.get(), size) }
+    }
+
     /// Returns a mapper for this inode.
     ///
     /// # Safety

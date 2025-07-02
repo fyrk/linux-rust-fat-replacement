@@ -2,6 +2,8 @@
 
 //! FAT file system.
 
+use core::slice;
+
 use defs::*;
 use kernel::fs::{
     self, address_space, dentry, dentry::DEntry, file, file::File, inode, inode::INode, iomap, sb,
@@ -406,6 +408,28 @@ impl fs::FileSystem for FatFs {
     }
 }
 
+struct ByteStr<'a>(pub &'a [u8]);
+
+impl core::fmt::Display for ByteStr<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use core::fmt::Write;
+
+        f.write_str("ByteStr(\"")?;
+        for b in self.0 {
+            let c = char::from_u32(*b as u32).unwrap_or('?');
+            f.write_char(c)?;
+            f.write_str(", ")?;
+        }
+        f.write_str(" // ")?;
+        for b in self.0 {
+            write!(f, "{b}")?;
+            f.write_str(" ")?;
+        }
+        f.write_str("\")")?;
+        Ok(())
+    }
+}
+
 #[vtable]
 impl file::Operations for FatFs {
     type FileSystem = Self;
@@ -429,9 +453,11 @@ impl file::Operations for FatFs {
         let folio = unsafe { file.inode().mapped_folio(*offset)? };
         let len = folio.len();
 
+        pr_info!("[read] folio size={size} offset={offset} len={len}, rem={rem}");
+
         rem = rem.min(len);
 
-        pr_info!("folio offset={offset} len={len}, rem={rem}");
+        pr_info!("Reading {}", ByteStr(&folio[..rem]));
 
         writer.write_slice(&folio[..rem])?;
         *offset += rem as i64;
@@ -445,7 +471,7 @@ impl file::Operations for FatFs {
     ) -> Result<usize> {
         let size = file.inode().size();
 
-        pr_info!("write called offset={offset}, size={size}");
+        pr_info!("[write] offset={offset}, size={size}");
 
         if *offset != 0 {
             panic!("Tried to write at non zero offset {offset}");
@@ -467,18 +493,32 @@ impl file::Operations for FatFs {
         let mut buf = KVec::new();
         reader.read_all(&mut buf, GFP_KERNEL)?;
         pr_info!("Writing {} bytes", buf.len());
+        pr_info!("Writing {}", ByteStr(&buf));
 
         let mut mapped = unsafe { file.inode().mapped_folio(*offset)? };
-        let mut folio = mapped.lock();
-        // maybe wrong lol
-        folio.mark_uptodate();
-        let err = folio.write(*offset as usize, &buf);
-        pr_info!("folio write res {err:?}");
-        err?;
+
+        // let err = folio.write(*offset as usize, &buf);
+        // pr_info!("folio write res {err:?}");
+        // err?;
 
         *offset += buf.len() as i64;
-
         pr_info!("offset={offset}");
+
+        let mem = unsafe { slice::from_raw_parts_mut((*mapped).as_ptr().cast_mut(), buf.len()) };
+        mem.copy_from_slice(&buf);
+
+        let mut folio = mapped.lock();
+        folio.mark_uptodate();
+
+        file.inode().set_size(*offset);
+
+        // let folio: kernel::folio::Mapped<'_, kernel::folio::PageCache<FatFs>> =
+        //     unsafe { file.inode().mapped_folio(*offset)? };
+        // pr_info!(
+        //     "Read after write {}, {}",
+        //     ByteStr(&folio[..buf.len()]),
+        //     buf.len()
+        // );
 
         Ok(buf.len())
     }

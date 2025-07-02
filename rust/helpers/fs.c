@@ -31,6 +31,11 @@ loff_t rust_helper_i_size_read(const struct inode *inode)
 	return i_size_read(inode);
 }
 
+void rust_helper_i_size_write(struct inode *inode, loff_t i_size)
+{
+	return i_size_write(inode, i_size);
+}
+
 void rust_helper_inode_lock_shared(struct inode *inode)
 {
 	inode_lock_shared(inode);
