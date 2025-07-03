@@ -2,8 +2,6 @@
 
 //! FAT file system.
 
-use core::slice;
-
 use defs::*;
 use kernel::fs::{
     self, address_space, dentry, dentry::DEntry, file, file::File, inode, inode::INode, iomap, sb,
@@ -497,18 +495,18 @@ impl file::Operations for FatFs {
 
         let mut mapped = unsafe { file.inode().mapped_folio(*offset)? };
 
-        // let err = folio.write(*offset as usize, &buf);
-        // pr_info!("folio write res {err:?}");
-        // err?;
-
-        *offset += buf.len() as i64;
-        pr_info!("offset={offset}");
-
-        let mem = unsafe { slice::from_raw_parts_mut((*mapped).as_ptr().cast_mut(), buf.len()) };
-        mem.copy_from_slice(&buf);
+        // let mem = unsafe { slice::from_raw_parts_mut((*mapped).as_ptr().cast_mut(), buf.len()) };
+        // mem.copy_from_slice(&buf);
 
         let mut folio = mapped.lock();
         folio.mark_uptodate();
+
+        let err = folio.write(*offset as usize, &buf);
+        pr_info!("folio write res {err:?}");
+        err?;
+
+        *offset += buf.len() as i64;
+        pr_info!("offset={offset}");
 
         file.inode().set_size(*offset);
 
